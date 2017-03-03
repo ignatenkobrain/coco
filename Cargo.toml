@@ -1,0 +1,12 @@
+[package]
+name = "epoch"
+version = "0.1.0"
+authors = ["Stjepan Glavina <stjepang@gmail.com>"]
+description = "Epoch-based memory reclamation"
+repository = "https://github.com/stjepang/epoch"
+documentation = "https://docs.rs/epoch"
+readme = "README.md"
+license = "Apache-2.0/MIT"
+
+[dependencies]
+scopeguard = "0.3"
