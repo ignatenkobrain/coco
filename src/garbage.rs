@@ -8,14 +8,14 @@
 //!
 //! TODO
 
-use super::Atomic;
-use super::Pin;
-use super::thread::dummy_pin;
-
 use std::cell::Cell;
 use std::mem;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
+
+use super::Atomic;
+use super::Pin;
+use super::thread::dummy_pin;
 
 // TODO: place here all the magic numbers (constants)
 

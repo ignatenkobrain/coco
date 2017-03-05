@@ -34,14 +34,14 @@
 //! die. Threads are good citizens, so they sometimes pop a few bags of garbage from the queue in
 //! order to free memory and thus help reduce the amount of accumulated garbage.
 
-use super::{Atomic, Ptr, TaggedAtomic, TaggedPtr};
-use super::garbage::{self, Bag};
-
 use std::cell::{Cell, UnsafeCell};
 use std::mem;
 use std::ptr;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{self, AtomicUsize, ATOMIC_USIZE_INIT};
+
+use super::{Atomic, Ptr, TaggedAtomic, TaggedPtr};
+use super::garbage::{self, Bag};
 
 // TODO: if we unlink a huge object, mark a bool in the pin and on unpinning yield until the epoch
 // advances enough so that we can empty the whole bag.
@@ -106,8 +106,7 @@ impl Drop for Harness {
         thread.set_pinned();
 
         // Spare some cycles on garbage collection.
-        atomic::fence(AcqRel);
-        let epoch = EPOCH.load(Relaxed);
+        let epoch = EPOCH.load(SeqCst);
         advance(epoch, pin);
         garbage::collect(epoch, pin);
 
@@ -140,18 +139,20 @@ impl Thread {
     /// Marks the thread as pinned.
     ///
     /// Must not be called if the thread is already pinned!
+    #[inline]
     fn set_pinned(&self) {
-        self.epoch.store(EPOCH.load(Relaxed), Relaxed);
-
         // Any further loads must not precede the store. In order words, this thread's epoch must
         // be fully announced before we load anything from the memory shared throught `Atomic`s.
-        atomic::fence(AcqRel);
+        self.epoch.store(EPOCH.load(Relaxed), Relaxed);
+        atomic::fence(SeqCst);
     }
 
     /// Marks the thread as unpinned.
+    #[inline]
     fn set_unpinned(&self) {
         // Nothing special about number 1, any odd number marks the thread as unpinned.
-        self.epoch.store(1, Release);
+        atomic::fence(Release);
+        self.epoch.store(1, Relaxed);
     }
 
     /// Registers a thread by adding it's entry to the list of participanting threads.
@@ -245,7 +246,7 @@ fn advance(epoch: usize, pin: &Pin) {
         } else {
             // If the thread was pinned in a different epoch, we cannot advance the global epoch
             // just yet.
-            let e = c.epoch.load(Acquire);
+            let e = c.epoch.load(SeqCst);
             if e % 2 == 0 && e != epoch {
                 return;
             }
@@ -258,7 +259,7 @@ fn advance(epoch: usize, pin: &Pin) {
     // All pinned threads were pinned in the current global epoch.
     // Finally, try advancing the epoch. We increment by 2 because epochs are even numbers, and
     // simply wrap around on overflow.
-    EPOCH.compare_and_swap(epoch, epoch.wrapping_add(2), AcqRel);
+    EPOCH.compare_and_swap(epoch, epoch.wrapping_add(2), SeqCst);
 }
 
 /// A witness that the current thread is pinned.
@@ -307,9 +308,9 @@ pub struct Pin {
 /// deleted objects protected by `Atomic`s. The provided function should be very quick - generally
 /// speaking, it shouldn't take more than 100 ms.
 ///
-/// Pinning itself executes some memory barriers and performs several atomic operations. However,
-/// this mechanism is designed to be as performant as possible, so it can be used pretty liberally.
-/// On a modern machine a single thread can perform around 200 million pinnings per second.
+/// Pinning itself comes with a price: it begins with a `SeqCst` fence and performs a few other
+/// atomic operations. However, this mechanism is designed to be as performant as possible, so it
+/// can be used pretty liberally. On a modern machine a single pinning takes around 20 nanoseconds.
 ///
 /// Pinning is reentrant. There is no harm in pinning a thread while it's already pinned (repinning
 /// is essentially a noop).
@@ -398,8 +399,7 @@ pub unsafe fn unlinked<T>(value: *mut T, count: usize, pin: &Pin) {
         cell.set(Box::into_raw(new));
 
         // Spare some cycles on garbage collection.
-        atomic::fence(AcqRel);
-        let epoch = EPOCH.load(Relaxed);
+        let epoch = EPOCH.load(SeqCst);
         advance(epoch, pin);
         garbage::collect(epoch, pin);
 

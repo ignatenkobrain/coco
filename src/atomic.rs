@@ -1,11 +1,11 @@
-use super::Pin;
-
 use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 use std::ops::Deref;
+
+use super::Pin;
 
 pub struct Ptr<'p, T: 'p> {
     ptr: *mut T, // !Send + !Sync
