@@ -7,6 +7,9 @@ use std::ops::Deref;
 
 use super::Pin;
 
+// TODO: derive Debug on public structs
+// TODO: impl Default
+
 pub struct Ptr<'p, T: 'p> {
     ptr: *mut T, // !Send + !Sync
     _marker: PhantomData<&'p T>,

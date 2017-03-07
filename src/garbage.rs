@@ -8,27 +8,50 @@
 //!
 //! TODO
 
-use std::cell::Cell;
 use std::mem;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 
 use super::Atomic;
 use super::Pin;
-use super::thread::dummy_pin;
 
-// TODO: place here all the magic numbers (constants)
+/// Maximal number of objects a bag can contain.
+const MAX_OBJECTS: usize = 64;
 
-/// TODO: document
-static GARBAGE: AtomicUsize = ATOMIC_USIZE_INIT;
+/// A bag is full when objects total at least this many bytes.
+const FULL_BYTES: usize = 1 << 16; // 16 KB
 
-/// Contains unlinked objects that will be eventually freed.
+/// A bag must be urgently freed when objects total at least this many bytes.
+const URGENT_BYTES: usize = 1 << 20; // 1 MB
+
+/// Number of bags per queue that are freed on each call to `collect`.
+const COLLECT_STEPS: usize = 8;
+
+/// The "normal" garbage queue, where most bags end up.
+static NORMAL_QUEUE: AtomicUsize = ATOMIC_USIZE_INIT;
+
+/// The "urgent" garbage queue, where unusally large bags end up.
+static URGENT_QUEUE: AtomicUsize = ATOMIC_USIZE_INIT;
+
+/// State of the garbage queues.
+///
+/// Are they under control or do they need urgent collection?
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    /// Normal state. No special intervention is needed.
+    Normal,
+
+    /// Urgent state. Collect aggressively until we go out of this state.
+    Urgent,
+}
+
+/// Holds unlinked objects that will be eventually freed.
 pub struct Bag {
     /// Number of objects in the bag.
-    len: Cell<usize>,
+    len: usize,
 
     /// Total memory in bytes occupied by the objects in the bag.
-    total_bytes: Cell<usize>,
+    total_bytes: usize,
 
     /// Unlinked objects.
     ///
@@ -37,7 +60,7 @@ pub struct Bag {
     /// 1. Function that reclaims memory.
     /// 2. Pointer to allocated array of objects.
     /// 3. Number of objects in the array.
-    objects: [(unsafe fn(*mut u8, usize), *mut u8, usize); 64],
+    objects: [(unsafe fn(*mut u8, usize), *mut u8, usize); MAX_OBJECTS],
 
     /// The global epoch at a moment after all contained objects were unlinked.
     epoch: usize,
@@ -50,8 +73,8 @@ impl Bag {
     /// Returns a new, empty bag.
     pub fn new() -> Self {
         Bag {
-            len: Cell::new(0),
-            total_bytes: Cell::new(0),
+            len: 0,
+            total_bytes: 0,
             objects: unsafe { mem::uninitialized() },
             epoch: 0,
             next: Atomic::null(),
@@ -61,43 +84,45 @@ impl Bag {
     /// Attempts to insert an object into the bag, and returns `true` on success.
     ///
     /// The object is stored in memory at address `ptr` and consists of `count` elements. The
-    /// attempt might fail because the bag is full or already holds too much garbage.
+    /// attempt might fail because the bag is full (already holds many or large objects).
     pub fn try_insert<T>(&mut self, ptr: *mut T, count: usize) -> bool {
-        let len = self.len.get();
-        let total_bytes = self.total_bytes.get();
-
-        if len == self.objects.len() || total_bytes >= 1 << 16 {
-            false
-        } else {
-            unsafe fn free<T>(ptr: *mut u8, count: usize) {
-                // Free the memory, but don't execute destructors.
-                drop(Vec::from_raw_parts(ptr as *mut T, 0, count));
-            }
-            self.objects[len] = (free::<T>, ptr as *mut u8, count);
-
-            self.len.set(len + 1);
-            self.total_bytes.set(total_bytes + mem::size_of::<T>() * count);
-
-            true
+        if self.is_full() {
+            return false;
         }
+
+        unsafe fn free<T>(ptr: *mut u8, count: usize) {
+            // Free the memory, but don't execute destructors.
+            drop(Vec::from_raw_parts(ptr as *mut T, 0, count));
+        }
+
+        self.objects[self.len] = (free::<T>, ptr as *mut u8, count);
+        self.len += 1;
+        self.total_bytes += mem::size_of::<T>() * count;
+        true
     }
 
-    /// Frees the memory occupied by all objects stored in the bag and then empties the bag.
+    /// Returns true if the bag is full.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.len == self.objects.len() || self.total_bytes >= FULL_BYTES
+    }
+
+    /// Frees the memory occupied by all objects stored in the bag.
+    ///
+    /// Note: can be called only once!
     unsafe fn free_all_objects(&self) {
-        for &(free, ptr, count) in self.objects.iter().take(self.len.get()) {
+        for &(free, ptr, count) in self.objects.iter().take(self.len) {
             free(ptr, count);
         }
-        self.len.set(0);
-        self.total_bytes.set(0);
     }
 }
 
 /// A garbage queue.
 ///
-/// This is the global queue where thread-local bags of unlinked objects eventually end up.
+/// This is a global queue where thread-local bags of unlinked objects eventually end up.
 /// The implementation is based on the typical Michael-Scott queue.
 #[repr(C)]
-struct Garbage {
+struct Queue {
     /// Head of the queue.
     ///
     /// The head is always a sentinel entry.
@@ -110,29 +135,32 @@ struct Garbage {
     tail: Atomic<Bag>,
 }
 
-impl Garbage {
+impl Queue {
     /// Returns a new, empty garbage queue.
     ///
     /// This function is only called when initializing the singleton.
     fn new() -> Self {
-        let garbage = Garbage {
+        let queue = Queue {
             head: Atomic::null(),
             _pad: unsafe { mem::uninitialized() },
             tail: Atomic::null(),
         };
 
-        unsafe {
-            // This code is executing while a thread harness is initializing, so normal pinning
-            // would try to access it while it is being initialized. Such accesses fail with a
-            // panic.
-            dummy_pin(|pin| {
-                // The head of the queue is always a sentinel entry.
-                let sentinel = garbage.head.store_box(Box::new(Bag::new()), Relaxed, pin);
-                garbage.tail.store(sentinel, Relaxed);
-            });
-        }
+        // This code is executing while a thread harness is initializing, so normal pinning would
+        // try to access it while it is being initialized. Such accesses fail with a panic.
+        // We cheat our way around this by creating a fake pin.
+        let pin = unsafe { &mem::zeroed::<Pin>() };
 
-        garbage
+        // The head of the queue is always a sentinel entry.
+        let sentinel = queue.head.store_box(Box::new(Bag::new()), Relaxed, pin);
+        queue.tail.store(sentinel, Relaxed);
+
+        queue
+    }
+
+    /// Returns true if the queue is empty.
+    fn is_empty(&self, pin: &Pin) -> bool {
+        self.head.load(Acquire, pin).unwrap().next.load(Relaxed, pin).is_null()
     }
 
     /// Pushes a bag into the queue.
@@ -195,44 +223,42 @@ impl Garbage {
     }
 }
 
-impl Drop for Garbage {
+impl Drop for Queue {
     fn drop(&mut self) {
-        unsafe {
-            // This code is executing while a thread harness is initializing, so normal pinning
-            // would try to access it while it is being initialized. Such accesses fail with a
-            // panic.
-            dummy_pin(|pin| {
-                let mut head = self.head.load(Acquire, pin);
+        // This code is executing while a thread harness is initializing, so normal pinning would
+        // try to access it while it is being initialized. Such accesses fail with a panic.
+        // We cheat our way around this by creating a fake pin.
+        let pin = unsafe { &mem::zeroed::<Pin>() };
 
-                while let Some(h) = head.as_ref() {
-                    let next = h.next.load(Relaxed, pin);
+        let mut head = self.head.load(Acquire, pin);
 
-                    if let Some(n) = next.as_ref() {
-                        // Because the head of the queue is a sentinel entry, we only free garbage
-                        // contained by successors.
-                        n.free_all_objects();
-                    }
+        while let Some(h) = head.as_ref() {
+            let next = h.next.load(Relaxed, pin);
 
-                    // Deallocate and move forward.
-                    drop(Vec::from_raw_parts(h as *const _ as *mut Bag, 0, 1));
-                    head = next;
-                }
-            })
+            if let Some(n) = next.as_ref() {
+                // Because the head of the queue is a sentinel entry, we only free garbage
+                // contained by successors.
+                unsafe { n.free_all_objects() }
+            }
+
+            // Deallocate and move forward.
+            unsafe { drop(Vec::from_raw_parts(h as *const _ as *mut Bag, 0, 1)) }
+            head = next;
         }
     }
 }
 
-/// Returns a reference to the global garbage queue.
+/// Returns a reference to a global garbage queue stored at `atomic`.
 ///
 /// The queue is lazily initialized on the first call to this function.
-fn garbage() -> &'static Garbage {
-    let current = GARBAGE.load(Acquire);
+fn singleton(atomic: &'static AtomicUsize) -> &'static Queue {
+    let current = atomic.load(Acquire);
 
-    let garbage = if current == 0 {
-        // Initialize garbage.
-        let raw = Box::into_raw(Box::new(Garbage::new()));
+    let queue = if current == 0 {
+        // Initialize the singleton.
+        let raw = Box::into_raw(Box::new(Queue::new()));
         let new = raw as usize;
-        let previous = GARBAGE.compare_and_swap(0, new, AcqRel);
+        let previous = atomic.compare_and_swap(0, new, AcqRel);
 
         if previous == 0 {
             // Ok, we initialized it.
@@ -246,26 +272,30 @@ fn garbage() -> &'static Garbage {
         current
     };
 
-    unsafe { &*(garbage as *const Garbage) }
+    unsafe { &*(queue as *const Queue) }
 }
 
-/// Pushes a bag into the global garbage queue and marks it with the current global epoch.
-pub fn push(mut bag: Box<Bag>, epoch: usize, pin: &Pin) {
-    let garbage = garbage();
+/// Pushes a bag unlinked just before `epoch` into a global queue and returns it's urgency level.
+pub fn push(mut bag: Box<Bag>, epoch: usize, pin: &Pin) -> Urgency {
     bag.epoch = epoch;
-    garbage.push(bag, pin);
+
+    if bag.total_bytes < URGENT_BYTES {
+        singleton(&NORMAL_QUEUE).push(bag, pin);
+        Urgency::Normal
+    } else {
+        singleton(&URGENT_QUEUE).push(bag, pin);
+        Urgency::Urgent
+    }
 }
 
-/// Collects several bags of garbage from the queue and frees them.
+/// Frees several bags from the queue and returns the urgency level after that.
 ///
 /// The argument `epoch` is the current global epoch.
 ///
 /// This function should be called when we have some cycles to spare, and it must be called at
 /// least as often as `push`. Because it collects more than one bag of garbage, the speed of
 /// collection is thus faster than the speed of garbage generation.
-pub fn collect(epoch: usize, pin: &Pin) {
-    let garbage = garbage();
-
+pub fn collect(epoch: usize, pin: &Pin) -> Urgency {
     let condition = |bag: &Bag| {
         // A pinned thread can witness at most two epoch advancements. Therefore, any bag that is
         // within two epochs of the current one cannot be freed yet.
@@ -273,11 +303,21 @@ pub fn collect(epoch: usize, pin: &Pin) {
         diff > 4 && diff < 0usize.wrapping_sub(4)
     };
 
-    // Collect several bags.
-    for _ in 0..8 {
-        match garbage.pop_if(&condition, pin) {
-            None => break,
-            Some(bag) => unsafe { bag.free_all_objects() },
+    let normal = singleton(&NORMAL_QUEUE);
+    let urgent = singleton(&URGENT_QUEUE);
+
+    for queue in &[normal, urgent] {
+        // Collect several bags.
+        for _ in 0..COLLECT_STEPS {
+            match normal.pop_if(&condition, pin) {
+                None => break,
+                Some(bag) => unsafe { bag.free_all_objects() },
+            }
         }
+    }
+
+    match urgent.is_empty(pin) {
+        true => Urgency::Normal,
+        false => Urgency::Urgent,
     }
 }
