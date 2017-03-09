@@ -4,7 +4,7 @@
 //!
 //! The global `STATE` number holds two pieces of data: the current global epoch and whether
 //! garbage needs to be urgently collected. Every so often the global epoch is incremented - we say
-//! it "advances". It can advance only if all currently pinned threads have been pinned in this
+//! it "advances". It can advance only if all currently pinned threads have been pinned in the
 //! current epoch.
 //!
 //! If an object became unreachable in some epoch, we can be sure that no thread will hold a
@@ -28,12 +28,12 @@
 //!
 //! If a pinned thread wants to stash away an unlinked object to free it's memory at a later safe
 //! time, it will store it in it's thread-local bag. If the local bag is full, it must first be
-//! replaced with a fresh one. The old bag is then pushed into the global garbage queue and marked
+//! replaced with a fresh one. The old bag is then pushed into a global garbage queue and marked
 //! with the current epoch.
 //!
-//! The global garbage queue lives in the `garbage` module and is the place where local bags go to
-//! die. Threads are good citizens, so they sometimes pop a few bags of garbage from the queue in
-//! order to free memory and thus help reduce the amount of accumulated garbage.
+//! Global garbage queues live in the `garbage` module. All local bags eventually end up there.
+//! Threads are good citizens so they sometimes pop a few bags of garbage from the global queues
+//! in order to free some memory and thus help reduce the amount of accumulated garbage.
 
 use std::cell::Cell;
 use std::mem;
@@ -41,21 +41,20 @@ use std::ptr;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{self, AtomicUsize, ATOMIC_USIZE_INIT};
 
-use super::{Atomic, Ptr, TaggedAtomic, TaggedPtr};
 use super::garbage::{self, Bag, Urgency};
+use super::{Atomic, Ptr, TaggedAtomic, TaggedPtr};
 
-// TODO: an unsafe unlinked method that does not require pinning
-// TODO: verify that there is no leaking
-
-// TODO: abstract EPOCH away as AtomicUsize
-// TODO: "the garbage queue" -> "a garbage queue"
-
-/// The global epoch number. TODO
+/// The global state (epoch and urgency).
 ///
-/// This number is always even because the last bit is reserved for threads to signify that they
-/// are not pinned.
+/// The last bit in this number indicates that garbage must be urgently collected, and the rest of
+/// the bits encode the current global epoch, which is always an even number.
 ///
-/// The global epoch is advanced by increasing the number by 2, and wrapping it around on overflow.
+/// More precisely:
+///
+/// * Urgency: `state & 1 == 1`
+/// * Epoch: `state & !1`
+///
+/// The global epoch is advanced by increasing the state by 2, and wrapping it around on overflow.
 /// A pinned thread may advance the epoch only if all pinned threads have been pinned with the
 /// current epoch.
 static STATE: AtomicUsize = ATOMIC_USIZE_INIT;
@@ -129,14 +128,14 @@ struct Thread {
     /// The global epoch just before the thread got pinned.
     ///
     /// If this number is odd, the thread is not pinned. In other words, the least significant bit
-    /// signifies that the thread is unpinned. Epochs are always even numbers so that they fit into
+    /// indicates that the thread is unpinned. Epochs are always even numbers so that they fit into
     /// the upper bits.
     state: AtomicUsize,
 
     /// The next thread in the linked list of participants.
     ///
     /// If the tag is 1, that signifies this entry is deleted and can be freely removed from the
-    /// list. Every participanting thread sets the tag to 1 when it exits.
+    /// list. Every participating thread sets the tag to 1 when it exits.
     next: TaggedAtomic<Thread>,
 }
 
@@ -168,7 +167,7 @@ impl Thread {
         self.state.store(1, Relaxed);
     }
 
-    /// Registers a thread by adding it's entry to the list of participanting threads.
+    /// Registers a thread by adding a new entry to the list of participanting threads.
     ///
     /// Returns a pointer to the newly allocated entry.
     fn register() -> *mut Thread {
@@ -180,9 +179,8 @@ impl Thread {
         });
 
         // This code is executing while the thread harness is initializing, so normal pinning would
-        // try to access it while it is being initialized. Such accesses fail with a panic.
-
-        // TODO: Explain.
+        // try to access it while it is being initialized. Such accesses fail with a panic. We must
+        // therefore cheat by creating a fake pin.
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
         let mut head = list.load(Acquire, pin);
@@ -205,10 +203,9 @@ impl Thread {
     /// This function doesn't physically remove the entry from the linked list, though. That will
     /// do any future call to `advance`.
     fn unregister(&self) {
-        // This code is executing while the thread harness is destructing, so normal pinning would
-        // try to access it while it is being destructed. Such accesses fail with a panic.
-
-        // TODO: Explain.
+        // This code is executing while the thread harness is initializing, so normal pinning would
+        // try to access it while it is being initialized. Such accesses fail with a panic. We must
+        // therefore cheat by creating a fake pin.
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
         // Simply mark the next-pointer in this thread's entry.
@@ -260,30 +257,32 @@ fn advance(pin: &Pin) {
             // Predecessor doesn't change.
             curr = succ;
         } else {
-            // If the thread was pinned in a different epoch, we cannot advance the global epoch
-            // just yet.
             let thread_state = c.state.load(SeqCst);
+            let thread_is_pinned = thread_state & 1 == 0;
             let thread_epoch = thread_state & !1;
 
-            if thread_state & 1 == 0 && thread_epoch != epoch {
+            // If the thread was pinned in a different epoch, we cannot advance the global epoch
+            // just yet.
+            if thread_is_pinned && thread_epoch != epoch {
                 return;
             }
 
+            // Move one step forward.
             pred = &c.next;
             curr = succ;
         }
     }
 
     // All pinned threads were pinned in the current global epoch.
-    // Finally, try advancing the epoch. We increment by 2 because epochs are even numbers, and
-    // simply wrap around on overflow. TODO
+    // Finally, try advancing the epoch. We increment by 2 and simply wrap around on overflow.
     STATE.compare_and_swap(state, state.wrapping_add(2), SeqCst);
 }
 
 /// A witness that the current thread is pinned.
 ///
-/// A reference to `Pin` is proof that the current thread is pinned. Interaction with `Atomic` is
-/// safe only while the thread is pinned so it's methods often require such references.
+/// A reference to `Pin` is proof that the current thread is pinned. Lots of methods that interact
+/// with `Atomic`s can safely be called only while the thread is pinned so they often require a
+/// reference to `Pin`.
 ///
 /// This data type is inherently bound to the thread that created it, therefore it does not
 /// implement `Send` nor `Sync`.
@@ -308,11 +307,11 @@ fn advance(pin: &Pin) {
 /// ```
 #[derive(Debug)]
 pub struct Pin {
-    /// A pointer to the cell within `HARNESS`, which holds a pointer to the local bag.
+    /// A pointer to the cell within the harness, which holds a pointer to the local bag.
     ///
     /// This pointer is kept within `Pin` as a matter of convenience. It could also be reached
-    /// through `HARNESS` itself, but that doesn't work if we in the process of it's destruction.
-    /// Anyways, this pointer makes some things a lot simpler, and possibly also slightly more
+    /// through the harness itself, but that doesn't work if we in the process of it's destruction.
+    /// In any case, this pointer makes some things a lot simpler, and possibly also slightly more
     /// performant.
     bag: *const Cell<*mut Bag>, // !Send + !Sync
 }
@@ -363,7 +362,7 @@ pub struct Pin {
 /// });
 ///
 /// // When `Atomic` gets destructed, it doesn't do anything with the object it references.
-/// // We must announce that it got unlinked, otherwise it will leak memory.
+/// // We must announce that it got unlinked, otherwise memory gets leaked.
 /// unsafe { epoch::pin(|pin| a.load(Relaxed, pin).unlinked(pin)) }
 /// ```
 pub fn pin<F, T>(f: F) -> T
@@ -378,16 +377,24 @@ pub fn pin<F, T>(f: F) -> T
             harness.is_pinned.set(true);
 
             if thread.set_pinned() == Urgency::Urgent {
+                // Try advancing the epoch and collecting some garbage.
                 advance(pin);
-                let epoch = STATE.load(SeqCst) & !1;
-                garbage::collect(epoch, pin);
 
+                let state = STATE.load(SeqCst);
+                let epoch = state & !1;
+
+                if garbage::collect(epoch, pin) == Urgency::Normal {
+                    // Clear the urgency flag.
+                    STATE.compare_and_swap(state, epoch & !1, SeqCst);
+                }
+
+                // Unpin and pin again, in order to help advance the epoch as quickly as possible.
                 thread.set_unpinned();
                 thread.set_pinned();
             }
         }
 
-        // This will unpin the thread even in an unfortunate event of `f` panicking.
+        // This will unpin the thread even if `f` panics.
         defer! {
             if !was_pinned {
                 thread.set_unpinned();
@@ -399,7 +406,14 @@ pub fn pin<F, T>(f: F) -> T
     })
 }
 
-/// TODO: documentation
+/// Announces that an object just became unreachable and can be freed as soon as the global epoch
+/// sufficiently advances.
+///
+/// The object was allocated at address `value`, and consists of `count` elements of type `T`.
+///
+/// Other currently pinned threads might still be holding a reference to the object. When they get
+/// unpinned, it will be safe to free it's memory. No particular guarantees are made when exactly
+/// that will happen.
 pub unsafe fn unlinked<T>(value: *mut T, count: usize, pin: &Pin) {
     let size = ::std::mem::size_of::<T>();
 
