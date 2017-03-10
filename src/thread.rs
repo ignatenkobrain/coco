@@ -65,7 +65,7 @@ static STATE: AtomicUsize = ATOMIC_USIZE_INIT;
 /// this is an easy zero-cost method of initializing it. This head pointer must be accessed using
 /// the `participants` function.
 ///
-/// Each thread is registered on it's first call to `pin` by adding it's own newly allocated entry
+/// Each thread is registered on it's first call to `pin()` by adding it's own newly allocated entry
 /// to the head of this list. Unregistration is triggered by destruction of the thread-local
 /// `Harness`, which happens on thread exit.
 static PARTICIPANTS: AtomicUsize = ATOMIC_USIZE_INIT;
@@ -78,7 +78,7 @@ thread_local! {
     /// the thread.
     static HARNESS: Harness = Harness {
         thread: Thread::register(),
-        is_pinned: Cell::new(false),
+        pin_count: Cell::new(0),
         bag: Cell::new(Box::into_raw(Box::new(Bag::new()))),
     };
 }
@@ -88,8 +88,8 @@ struct Harness {
     /// This thread's entry in the participants list.
     thread: *const Thread,
 
-    /// Whether the thread is currently pinned.
-    is_pinned: Cell<bool>,
+    /// Number of pending uses of `pin()`.
+    pin_count: Cell<usize>,
 
     /// The local bag of unlinked objects.
     bag: Cell<*mut Bag>,
@@ -101,24 +101,28 @@ impl Drop for Harness {
         // queue. Also, let's try advancing the epoch and help free some garbage.
         let thread = unsafe { &*self.thread };
 
-        // If we called the `pin` function here, it would try to access `HARNESS` and then panic.
+        // If we called `pin()` here, it would try to access `HARNESS` and then panic.
         // To work around the problem, we manually pin the thread.
-        let pin = &Pin { bag: &self.bag };
         thread.set_pinned();
+        let guard = Guard { harness: self };
 
         // Spare some cycles on garbage collection.
         // Note: this may itself produce garbage and in turn allocate new bags.
-        advance(pin);
+        advance(&guard);
         let epoch = STATE.load(SeqCst) & !1;
-        garbage::collect(epoch, pin);
+        garbage::collect(epoch, &guard);
 
         // Push the local bag into a garbage queue.
         let bag = unsafe { Box::from_raw(self.bag.get()) };
-        if garbage::push(bag, epoch, pin) == Urgency::Urgent {
+        if garbage::push(bag, epoch, &guard) == Urgency::Urgent {
             STATE.fetch_or(1, SeqCst);
         }
 
+        // Forget the guard and manually unpin the thread.
+        mem::forget(guard);
         thread.set_unpinned();
+
+        // Mark the thread entry as deleted.
         thread.unregister();
     }
 }
@@ -172,30 +176,36 @@ impl Thread {
     /// Returns a pointer to the newly allocated entry.
     fn register() -> *mut Thread {
         let list = participants();
+
         let mut new = Box::new(Thread {
             // Nothing special about number 1, any odd number marks the thread as unpinned.
             state: AtomicUsize::new(1),
             next: TaggedAtomic::null(0),
         });
+        let ptr = &mut *new as *mut _;
 
         // This code is executing while the thread harness is initializing, so normal pinning would
         // try to access it while it is being initialized. Such accesses fail with a panic. We must
-        // therefore cheat by creating a fake pin.
-        let pin = unsafe { &mem::zeroed::<Pin>() };
+        // therefore cheat by creating a fake guard and then forgetting it.
+        let guard = unsafe { mem::zeroed::<Guard>() };
+        {
+            let mut head = list.load(Acquire, &guard);
+            loop {
+                new.next.store(head, Relaxed);
 
-        let mut head = list.load(Acquire, pin);
-        loop {
-            new.next.store(head, Relaxed);
-
-            // Try installing this thread's entry as the new head.
-            match list.cas_box_weak(head, new, 0, AcqRel) {
-                Ok(n) => return n.as_raw(),
-                Err((h, n)) => {
-                    head = h;
-                    new = n;
+                // Try installing this thread's entry as the new head.
+                match list.cas_box_weak(head, new, 0, AcqRel) {
+                    Ok(n) => break,
+                    Err((h, n)) => {
+                        head = h;
+                        new = n;
+                    }
                 }
             }
         }
+        mem::forget(guard);
+
+        ptr
     }
 
     /// Unregisters the thread by marking it's entry as deleted.
@@ -205,17 +215,19 @@ impl Thread {
     fn unregister(&self) {
         // This code is executing while the thread harness is initializing, so normal pinning would
         // try to access it while it is being initialized. Such accesses fail with a panic. We must
-        // therefore cheat by creating a fake pin.
-        let pin = unsafe { &mem::zeroed::<Pin>() };
-
-        // Simply mark the next-pointer in this thread's entry.
-        let mut next = self.next.load(Acquire, pin);
-        while next.tag() == 0 {
-            match self.next.cas_weak(next, next.with_tag(1), AcqRel) {
-                Ok(()) => break,
-                Err(n) => next = n,
+        // therefore cheat by creating a fake guard and then forgetting it.
+        let guard = unsafe { mem::zeroed::<Guard>() };
+        {
+            // Simply mark the next-pointer in this thread's entry.
+            let mut next = self.next.load(Acquire, &guard);
+            while next.tag() == 0 {
+                match self.next.cas_weak(next, next.with_tag(1), AcqRel) {
+                    Ok(()) => break,
+                    Err(n) => next = n,
+                }
             }
         }
+        mem::forget(guard);
     }
 }
 
@@ -229,16 +241,17 @@ fn participants() -> &'static TaggedAtomic<Thread> {
 ///
 /// The global epoch can advance only if all currently pinned threads have been pinned in the
 /// current epoch.
-fn advance(pin: &Pin) {
+#[cold]
+fn advance(guard: &Guard) {
     let state = STATE.load(SeqCst);
     let epoch = state & !1;
 
     // Traverse the linked list of participating threads.
     let mut pred = participants();
-    let mut curr = pred.load(Acquire, pin);
+    let mut curr = pred.load(Acquire, guard);
 
     while let Some(c) = curr.as_ref() {
-        let succ = c.next.load(Acquire, pin);
+        let succ = c.next.load(Acquire, guard);
 
         if succ.tag() == 1 {
             // This thread has exited. Try unlinking it from the list.
@@ -252,7 +265,7 @@ fn advance(pin: &Pin) {
             }
 
             // Free the entry allocated by the unlinked thread.
-            unsafe { unlinked(c as *const _ as *mut Thread, 1, pin) }
+            unsafe { unlinked(c as *const _ as *mut Thread, 1, guard) }
 
             // Predecessor doesn't change.
             curr = succ;
@@ -280,9 +293,9 @@ fn advance(pin: &Pin) {
 
 /// A witness that the current thread is pinned.
 ///
-/// A reference to `Pin` is proof that the current thread is pinned. Lots of methods that interact
-/// with `Atomic`s can safely be called only while the thread is pinned so they often require a
-/// reference to `Pin`.
+/// A reference to `Guard` is proof that the current thread is pinned. Lots of methods that
+/// interact with `Atomic`s can safely be called only while the thread is pinned so they often
+/// require a reference to `Guard`.
 ///
 /// This data type is inherently bound to the thread that created it, therefore it does not
 /// implement `Send` nor `Sync`.
@@ -290,41 +303,56 @@ fn advance(pin: &Pin) {
 /// # Examples
 ///
 /// ```
-/// use epoch::{self, Pin, Atomic};
+/// use epoch::{self, Atomic, Guard};
 /// use std::sync::atomic::Ordering::SeqCst;
 ///
 /// struct Foo(Atomic<String>);
 ///
 /// impl Foo {
-///     fn get<'p>(&self, pin: &'p Pin) -> &'p str {
-///         self.0.load(SeqCst, pin).unwrap()
+///     fn get<'g>(&self, guard: &'g Guard) -> &'g str {
+///         self.0.load(SeqCst, guard).unwrap()
 ///     }
 /// }
 ///
 /// let foo = Foo(Atomic::new("hello".to_string()));
 ///
-/// epoch::pin(|pin| assert_eq!(foo.get(pin), "hello"));
+/// let guard = epoch::pin();
+/// assert_eq!(foo.get(&guard), "hello");
 /// ```
 #[derive(Debug)]
-pub struct Pin {
-    /// A pointer to the cell within the harness, which holds a pointer to the local bag.
+pub struct Guard {
+    /// A pointer to the harness.
     ///
-    /// This pointer is kept within `Pin` as a matter of convenience. It could also be reached
-    /// through the harness itself, but that doesn't work if we in the process of it's destruction.
-    /// In any case, this pointer makes some things a lot simpler, and possibly also slightly more
-    /// performant.
-    bag: *const Cell<*mut Bag>, // !Send + !Sync
+    /// This pointer is kept within `Guard` as a matter of convenience. It could also be reached
+    /// through the `HARNESS` thread-local, but that doesn't work if we are in the process of it's
+    /// destruction.
+    harness: *const Harness,
+}
+
+impl Drop for Guard {
+    #[inline]
+    fn drop(&mut self) {
+        let harness = unsafe { &*self.harness };
+
+        let c = harness.pin_count.get();
+        harness.pin_count.set(c - 1);
+
+        if c == 1 {
+            let thread = unsafe { &*harness.thread };
+            thread.set_unpinned();
+        }
+    }
 }
 
 /// Pins the current thread.
 ///
-/// The provided function takes a reference to a `Pin`, which can be used to interact with
-/// `Atomic`s. The pin serves as a proof that whatever data you load from an `Atomic` will not be
-/// concurrently deleted by another thread while the pin is alive.
+/// A guard is returned, which unpins the thread as soon as it gets dropped. The guard serves as
+/// proof that whatever data you load from an `Atomic` will not be concurrently deleted by another
+/// thread while the pin is alive.
 ///
 /// Note that keeping a thread pinned for a long time prevents memory reclamation of any newly
-/// deleted objects protected by `Atomic`s. The provided function should be very quick - generally
-/// speaking, it shouldn't take more than 100 ms.
+/// deleted objects protected by `Atomic`s. The returned guard should be short-lived: generally
+/// speaking, it shouldn't live for more than 100 ms.
 ///
 /// Pinning itself comes with a price: it begins with a `SeqCst` fence and performs a few other
 /// atomic operations. However, this mechanism is designed to be as performant as possible, so it
@@ -344,65 +372,58 @@ pub struct Pin {
 /// // Create a shared heap-allocated integer.
 /// let a = Atomic::new(10);
 ///
-/// epoch::pin(|pin| {
+/// {
+///     // Pin the current thread.
+///     let guard = epoch::pin();
+///
 ///     // Load the atomic.
-///     let old = a.load(Relaxed, pin);
+///     let old = a.load(Relaxed, &guard);
 ///     assert_eq!(*old.unwrap(), 10);
 ///
 ///     // Store a new heap-allocated integer in it's place.
-///     a.store_box(Box::new(20), Relaxed, pin);
+///     a.store_box(Box::new(20), Relaxed, &guard);
 ///
 ///     // The old value is not reachable anymore.
 ///     // The piece of memory it owns will be reclaimed at a later time.
-///     unsafe { old.unlinked(pin) }
+///     unsafe { old.unlinked(&guard) }
 ///
 ///     // Load the atomic again.
-///     let new = a.load(Relaxed, pin);
+///     let new = a.load(Relaxed, &guard);
 ///     assert_eq!(*new.unwrap(), 20);
-/// });
+/// }
 ///
 /// // When `Atomic` gets destructed, it doesn't do anything with the object it references.
 /// // We must announce that it got unlinked, otherwise memory gets leaked.
-/// unsafe { epoch::pin(|pin| a.load(Relaxed, pin).unlinked(pin)) }
+/// let guard = epoch::pin();
+/// unsafe { a.load(Relaxed, &guard).unlinked(&guard) }
 /// ```
-pub fn pin<F, T>(f: F) -> T
-    where F: FnOnce(&Pin) -> T
-{
+#[inline]
+pub fn pin() -> Guard {
     HARNESS.with(|harness| {
         let thread = unsafe { &*harness.thread };
-        let pin = &Pin { bag: &harness.bag };
+        let guard = Guard { harness: harness };
 
-        let was_pinned = harness.is_pinned.get();
-        if !was_pinned {
-            harness.is_pinned.set(true);
+        let c = harness.pin_count.get();
+        harness.pin_count.set(c + 1);
 
-            if thread.set_pinned() == Urgency::Urgent {
-                // Try advancing the epoch and collecting some garbage.
-                advance(pin);
+        if c == 0 && thread.set_pinned() == Urgency::Urgent {
+            // Try advancing the epoch and collecting some garbage.
+            advance(&guard);
 
-                let state = STATE.load(SeqCst);
-                let epoch = state & !1;
+            let state = STATE.load(SeqCst);
+            let epoch = state & !1;
 
-                if garbage::collect(epoch, pin) == Urgency::Normal {
-                    // Clear the urgency flag.
-                    STATE.compare_and_swap(state, epoch & !1, SeqCst);
-                }
-
-                // Unpin and pin again, in order to help advance the epoch as quickly as possible.
-                thread.set_unpinned();
-                thread.set_pinned();
+            if garbage::collect(epoch, &guard) == Urgency::Normal {
+                // Clear the urgency flag.
+                STATE.compare_and_swap(state, epoch & !1, SeqCst);
             }
+
+            // Unpin and pin again, in order to help advance the epoch as quickly as possible.
+            thread.set_unpinned();
+            thread.set_pinned();
         }
 
-        // This will unpin the thread even if `f` panics.
-        defer! {
-            if !was_pinned {
-                thread.set_unpinned();
-                harness.is_pinned.set(false);
-            }
-        }
-
-        f(pin)
+        guard
     })
 }
 
@@ -414,10 +435,15 @@ pub fn pin<F, T>(f: F) -> T
 /// Other currently pinned threads might still be holding a reference to the object. When they get
 /// unpinned, it will be safe to free it's memory. No particular guarantees are made when exactly
 /// that will happen.
-pub unsafe fn unlinked<T>(value: *mut T, count: usize, pin: &Pin) {
+///
+/// This function should only be used when building primitives like [Atomic] or fiddling with raw
+/// pointers.
+///
+/// [Atomic]: struct.Atomic.html
+pub unsafe fn unlinked<T>(value: *mut T, count: usize, guard: &Guard) {
     let size = ::std::mem::size_of::<T>();
 
-    let cell = &*pin.bag;
+    let cell = &(*guard.harness).bag;
     let bag = cell.get();
 
     assert!((*bag).try_insert(value, count));
@@ -427,13 +453,13 @@ pub unsafe fn unlinked<T>(value: *mut T, count: usize, pin: &Pin) {
         cell.set(Box::into_raw(Box::new(Bag::new())));
 
         // Spare some cycles on garbage collection.
-        advance(pin);
+        advance(guard);
         let epoch = STATE.load(SeqCst) & !1;
-        garbage::collect(epoch, pin);
+        garbage::collect(epoch, guard);
 
         // Finally, push the old bag into the garbage queue.
         let bag = unsafe { Box::from_raw(bag) };
-        if garbage::push(bag, epoch, pin) == Urgency::Urgent {
+        if garbage::push(bag, epoch, guard) == Urgency::Urgent {
             STATE.fetch_or(1, SeqCst);
         }
     }

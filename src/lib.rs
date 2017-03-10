@@ -8,9 +8,6 @@
 // TODO: Debug for atomics, ptrs and pin
 // TODO: swap method on atomics
 
-#[macro_use(defer)]
-extern crate scopeguard;
-
 mod atomic;
 mod garbage;
 mod tagged_atomic;
@@ -18,6 +15,6 @@ mod thread;
 
 pub use self::atomic::{Atomic, Ptr};
 pub use self::tagged_atomic::{TaggedAtomic, TaggedPtr};
-pub use self::thread::{pin, Pin, unlinked};
+pub use self::thread::{Guard, pin, unlinked};
 
 // TODO: unit tests

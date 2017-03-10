@@ -1,19 +1,27 @@
-//! TODO: Explain how global garbage and bags work
+//! Garbage collection
+//!
+//! # Objects and bags
+//!
+//! Objects that get unlinked from lock-free data structures (or otherwise become unreachable) are
+//! stashed away until the global epoch sufficiently advances so that they become safe to be freed.
+//!
+//! Such objects are first stored in [Bag]s.
 //!
 //! # Life of a bag
 //!
 //! TODO
 //!
-//! # The garbage queue
+//! # The garbage queues
 //!
 //! TODO
+//!
+//! [Bag]: struct.Bag.html
 
 use std::mem;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 
-use super::Atomic;
-use super::Pin;
+use super::{Atomic, Guard};
 
 /// Maximal number of objects a bag can contain.
 const MAX_OBJECTS: usize = 64;
@@ -148,28 +156,30 @@ impl Queue {
 
         // This code is executing while a thread harness is initializing, so normal pinning would
         // try to access it while it is being initialized. Such accesses fail with a panic.
-        // We cheat our way around this by creating a fake pin.
-        let pin = unsafe { &mem::zeroed::<Pin>() };
-
-        // The head of the queue is always a sentinel entry.
-        let sentinel = queue.head.store_box(Box::new(Bag::new()), Relaxed, pin);
-        queue.tail.store(sentinel, Relaxed);
+        // We cheat our way around this by creating a fake guard and then forgetting it.
+        let guard = unsafe { mem::zeroed::<Guard>() };
+        {
+            // The head of the queue is always a sentinel entry.
+            let sentinel = queue.head.store_box(Box::new(Bag::new()), Relaxed, &guard);
+            queue.tail.store(sentinel, Relaxed);
+        }
+        mem::forget(guard);
 
         queue
     }
 
     /// Returns true if the queue is empty.
-    fn is_empty(&self, pin: &Pin) -> bool {
-        self.head.load(Acquire, pin).unwrap().next.load(Relaxed, pin).is_null()
+    fn is_empty(&self, guard: &Guard) -> bool {
+        self.head.load(Acquire, guard).unwrap().next.load(Relaxed, guard).is_null()
     }
 
     /// Pushes a bag into the queue.
     ///
     /// The bag must be marked with an epoch beforehand.
-    fn push(&self, mut bag: Box<Bag>, pin: &Pin) {
-        let mut tail = self.tail.load(Acquire, pin);
+    fn push(&self, mut bag: Box<Bag>, guard: &Guard) {
+        let mut tail = self.tail.load(Acquire, guard);
         loop {
-            let next = tail.unwrap().next.load(Acquire, pin);
+            let next = tail.unwrap().next.load(Acquire, guard);
 
             if next.is_null() {
                 // Try installing the new bag.
@@ -197,19 +207,19 @@ impl Queue {
     /// Pops a bag from the front of the queue and returns it if the `condition` is met.
     ///
     /// If the bag on the front doesn't meet it or if the queue is empty, `None` is returned.
-    fn pop_if<'p, F>(&self, condition: F, pin: &'p Pin) -> Option<&'p Bag>
+    fn pop_if<'g, F>(&self, condition: F, guard: &'g Guard) -> Option<&'g Bag>
         where F: Fn(&Bag) -> bool
     {
-        let mut head = self.head.load(Acquire, pin);
+        let mut head = self.head.load(Acquire, guard);
         loop {
-            let next = head.unwrap().next.load(Acquire, pin);
+            let next = head.unwrap().next.load(Acquire, guard);
 
             match next.as_ref() {
                 Some(n) if condition(n) => {
                     // Try unlinking the head by moving it forward.
                     match self.head.cas_weak(head, next, AcqRel) {
                         Ok(()) => {
-                            unsafe { head.unlinked(pin) }
+                            unsafe { head.unlinked(guard) }
                             // The unlinked head was just a sentinel.
                             // It's successor is the real head.
                             return Some(n);
@@ -227,24 +237,26 @@ impl Drop for Queue {
     fn drop(&mut self) {
         // This code is executing while a thread harness is initializing, so normal pinning would
         // try to access it while it is being initialized. Such accesses fail with a panic.
-        // We cheat our way around this by creating a fake pin.
-        let pin = unsafe { &mem::zeroed::<Pin>() };
+        // We cheat our way around this by creating a fake guard and then forgetting it.
+        let guard = unsafe { mem::zeroed::<Guard>() };
+        {
+            let mut head = self.head.load(Acquire, &guard);
 
-        let mut head = self.head.load(Acquire, pin);
+            while let Some(h) = head.as_ref() {
+                let next = h.next.load(Relaxed, &guard);
 
-        while let Some(h) = head.as_ref() {
-            let next = h.next.load(Relaxed, pin);
+                if let Some(n) = next.as_ref() {
+                    // Because the head of the queue is a sentinel entry, we only free garbage
+                    // contained by successors.
+                    unsafe { n.free_all_objects() }
+                }
 
-            if let Some(n) = next.as_ref() {
-                // Because the head of the queue is a sentinel entry, we only free garbage
-                // contained by successors.
-                unsafe { n.free_all_objects() }
+                // Deallocate and move forward.
+                unsafe { drop(Vec::from_raw_parts(h as *const _ as *mut Bag, 0, 1)) }
+                head = next;
             }
-
-            // Deallocate and move forward.
-            unsafe { drop(Vec::from_raw_parts(h as *const _ as *mut Bag, 0, 1)) }
-            head = next;
         }
+        mem::forget(guard);
     }
 }
 
@@ -276,14 +288,14 @@ fn singleton(atomic: &'static AtomicUsize) -> &'static Queue {
 }
 
 /// Pushes a bag unlinked just before `epoch` into a global queue and returns it's urgency level.
-pub fn push(mut bag: Box<Bag>, epoch: usize, pin: &Pin) -> Urgency {
+pub fn push(mut bag: Box<Bag>, epoch: usize, guard: &Guard) -> Urgency {
     bag.epoch = epoch;
 
     if bag.total_bytes < URGENT_BYTES {
-        singleton(&NORMAL_QUEUE).push(bag, pin);
+        singleton(&NORMAL_QUEUE).push(bag, guard);
         Urgency::Normal
     } else {
-        singleton(&URGENT_QUEUE).push(bag, pin);
+        singleton(&URGENT_QUEUE).push(bag, guard);
         Urgency::Urgent
     }
 }
@@ -295,7 +307,8 @@ pub fn push(mut bag: Box<Bag>, epoch: usize, pin: &Pin) -> Urgency {
 /// This function should be called when we have some cycles to spare, and it must be called at
 /// least as often as `push`. Because it collects more than one bag of garbage, the speed of
 /// collection is thus faster than the speed of garbage generation.
-pub fn collect(epoch: usize, pin: &Pin) -> Urgency {
+#[cold]
+pub fn collect(epoch: usize, guard: &Guard) -> Urgency {
     let condition = |bag: &Bag| {
         // A pinned thread can witness at most two epoch advancements. Therefore, any bag that is
         // within two epochs of the current one cannot be freed yet.
@@ -309,14 +322,14 @@ pub fn collect(epoch: usize, pin: &Pin) -> Urgency {
     for queue in &[normal, urgent] {
         // Collect several bags.
         for _ in 0..COLLECT_STEPS {
-            match normal.pop_if(&condition, pin) {
+            match normal.pop_if(&condition, guard) {
                 None => break,
                 Some(bag) => unsafe { bag.free_all_objects() },
             }
         }
     }
 
-    match urgent.is_empty(pin) {
+    match urgent.is_empty(guard) {
         true => Urgency::Normal,
         false => Urgency::Urgent,
     }

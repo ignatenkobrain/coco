@@ -5,17 +5,17 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 use std::ops::Deref;
 
-use super::Pin;
+use super::Guard;
 
 // TODO: derive Debug on public structs
 // TODO: impl Default
 
-pub struct Ptr<'p, T: 'p> {
+pub struct Ptr<'g, T: 'g> {
     ptr: *mut T, // !Send + !Sync
-    _marker: PhantomData<&'p T>,
+    _marker: PhantomData<&'g T>,
 }
 
-impl<'p, T> Clone for Ptr<'p, T> {
+impl<'g, T> Clone for Ptr<'g, T> {
     fn clone(&self) -> Self {
         Ptr {
             ptr: self.ptr,
@@ -24,9 +24,9 @@ impl<'p, T> Clone for Ptr<'p, T> {
     }
 }
 
-impl<'p, T> Copy for Ptr<'p, T> {}
+impl<'g, T> Copy for Ptr<'g, T> {}
 
-impl<'p, T> Ptr<'p, T> {
+impl<'g, T> Ptr<'g, T> {
     pub fn null() -> Self {
         unsafe { Self::from_raw(ptr::null_mut()) }
     }
@@ -42,7 +42,7 @@ impl<'p, T> Ptr<'p, T> {
         self.ptr.is_null()
     }
 
-    pub fn as_ref(&self) -> Option<&'p T> {
+    pub fn as_ref(&self) -> Option<&'g T> {
         unsafe { self.ptr.as_ref() }
     }
 
@@ -50,13 +50,13 @@ impl<'p, T> Ptr<'p, T> {
         self.ptr
     }
 
-    pub fn unwrap(&self) -> &'p T {
+    pub fn unwrap(&self) -> &'g T {
         self.as_ref().unwrap()
     }
 
-    pub unsafe fn unlinked(&self, pin: &'p Pin) {
+    pub unsafe fn unlinked(&self, guard: &'g Guard) {
         if !self.ptr.is_null() {
-            super::unlinked(self.ptr, 1, pin);
+            super::unlinked(self.ptr, 1, guard);
         }
     }
 }
@@ -85,22 +85,22 @@ impl<T> Atomic<T> {
         }
     }
 
-    pub fn load<'p>(&self, order: Ordering, _: &'p Pin) -> Ptr<'p, T> {
+    pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> Ptr<'g, T> {
         unsafe { Ptr::from_raw(self.ptr.load(order)) }
     }
 
-    pub fn store<'p>(&self, new: Ptr<'p, T>, order: Ordering) {
+    pub fn store<'g>(&self, new: Ptr<'g, T>, order: Ordering) {
         self.ptr.store(new.ptr, order);
     }
 
-    pub fn store_box<'p>(&self, new: Box<T>, order: Ordering, pin: &'p Pin) -> Ptr<'p, T> {
+    pub fn store_box<'g>(&self, new: Box<T>, order: Ordering, guard: &'g Guard) -> Ptr<'g, T> {
         let r = unsafe { Ptr::from_raw(Box::into_raw(new)) };
         self.ptr.store(r.ptr, order);
         r
     }
 
-    pub fn cas<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>, order: Ordering)
-                   -> Result<(), Ptr<'p, T>> {
+    pub fn cas<'g>(&self, current: Ptr<'g, T>, new: Ptr<'g, T>, order: Ordering)
+                   -> Result<(), Ptr<'g, T>> {
         let previous = self.ptr.compare_and_swap(current.ptr, new.ptr, order);
         if previous == current.ptr {
             Ok(())
@@ -109,8 +109,8 @@ impl<T> Atomic<T> {
         }
     }
 
-    pub fn cas_weak<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>, order: Ordering)
-                        -> Result<(), Ptr<'p, T>> {
+    pub fn cas_weak<'g>(&self, current: Ptr<'g, T>, new: Ptr<'g, T>, order: Ordering)
+                        -> Result<(), Ptr<'g, T>> {
         let failure_order = match order {
             AcqRel => Acquire,
             Release => Relaxed,
@@ -122,8 +122,8 @@ impl<T> Atomic<T> {
         }
     }
 
-    pub fn cas_box<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, order: Ordering)
-                       -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
+    pub fn cas_box<'g>(&self, current: Ptr<'g, T>, mut new: Box<T>, order: Ordering)
+                       -> Result<Ptr<'g, T>, (Ptr<'g, T>, Box<T>)> {
         let previous = self.ptr.compare_and_swap(current.ptr, new.as_mut(), order);
         if previous == current.ptr {
             unsafe { Ok(Ptr::from_raw(Box::into_raw(new))) }
@@ -132,8 +132,8 @@ impl<T> Atomic<T> {
         }
     }
 
-    pub fn cas_box_weak<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, order: Ordering)
-                            -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
+    pub fn cas_box_weak<'g>(&self, current: Ptr<'g, T>, mut new: Box<T>, order: Ordering)
+                            -> Result<Ptr<'g, T>, (Ptr<'g, T>, Box<T>)> {
         let failure_order = match order {
             AcqRel => Acquire,
             Release => Relaxed,
