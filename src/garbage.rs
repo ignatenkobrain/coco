@@ -3,19 +3,37 @@
 //! # Objects and bags
 //!
 //! Objects that get unlinked from lock-free data structures (or otherwise become unreachable) are
-//! stashed away until the global epoch sufficiently advances so that they become safe to be freed.
-//!
-//! Such objects are first stored in [Bag]s.
+//! garbage, and they get stashed away until the global epoch sufficiently advances so that they
+//! become safe to be freed. Pointers to garbage objects are stored in bags.
 //!
 //! # Life of a bag
 //!
-//! TODO
+//! Each thread during it's registration creates a new thread-local bag. Any garbage objects the
+//! thread produces are added to it's thread-local bag.
+//!
+//! If a bag gets full, whether because it contains too many objects (`MAX_OBJECTS`) or the objects
+//! total too many bytes (`MAX_BYTES`), it is retired and replaced with a new, fresh bag. The old
+//! one then gets pushed into one of the two global queues (normal and urgent queue).
+//!
+//! Threads on exit retire their thread-local bags by pushing them into global queues.
 //!
 //! # The garbage queues
 //!
-//! TODO
+//! All bags eventually end up in one of the two global garbage queues. Threads call `collect()`
+//! from time to time in order to help reduce the amount of accumulated global garbage.
 //!
-//! [Bag]: struct.Bag.html
+//! There are two global queues:
+//!
+//! 1. Normal queue: most bags end up here.
+//! 2. Urgent queue: bags whose objects total unusually large amounts of bytes end up here.
+//!
+//! The urgent queue is particularly important when large arrays become garbage, for example when
+//! resizing hash tables or arrays backing worker-stealer queues grow or shrink. When that happens,
+//! an unusally large bag is detected, which gets pushed into the urgent queue.
+//!
+//! If the urgent queue is non-empty, the global state is flagged with urgency mode. Every pinning
+//! first checks for urgency mode. In case of urgency `collect()` gets called once. This continues
+//! until the urgent queue becomes empty and we return back to normal mode.
 
 use std::mem;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -35,10 +53,10 @@ const URGENT_BYTES: usize = 1 << 20; // 1 MB
 /// Number of bags per queue that are freed on each call to `collect`.
 const COLLECT_STEPS: usize = 8;
 
-/// The "normal" garbage queue, where most bags end up.
+/// The normal garbage queue, where most bags end up.
 static NORMAL_QUEUE: AtomicUsize = ATOMIC_USIZE_INIT;
 
-/// The "urgent" garbage queue, where unusally large bags end up.
+/// The urgent garbage queue, where unusally large bags end up.
 static URGENT_QUEUE: AtomicUsize = ATOMIC_USIZE_INIT;
 
 /// State of the garbage queues.

@@ -327,16 +327,21 @@ fn advance(guard: &Guard) {
 /// use epoch::{self, Atomic, Guard};
 /// use std::sync::atomic::Ordering::SeqCst;
 ///
+/// // Just a wrapper around strings.
 /// struct Foo(Atomic<String>);
 ///
 /// impl Foo {
+///     // A very simple getter.
+///     // Note that the returned reference is only valid as long as the guard is alive.
 ///     fn get<'g>(&self, guard: &'g Guard) -> &'g str {
 ///         self.0.load(SeqCst, guard).unwrap()
 ///     }
 /// }
 ///
+/// // Create a simple Foo that holds a string.
 /// let foo = Foo(Atomic::new("hello".to_string()));
 ///
+/// // Finally, access the string.
 /// let guard = epoch::pin();
 /// assert_eq!(foo.get(&guard), "hello");
 /// ```
@@ -368,11 +373,11 @@ impl Drop for Guard {
 /// Pins the current thread.
 ///
 /// A guard is returned, which unpins the thread as soon as it gets dropped. The guard serves as
-/// proof that whatever data you load from an `Atomic` will not be concurrently deleted by another
+/// proof that whatever data you load from an [Atomic] will not be concurrently deleted by another
 /// thread while the pin is alive.
 ///
 /// Note that keeping a thread pinned for a long time prevents memory reclamation of any newly
-/// deleted objects protected by `Atomic`s. The returned guard should be short-lived: generally
+/// deleted objects protected by [Atomic]s. The returned guard should be short-lived: generally
 /// speaking, it shouldn't live for more than 100 ms.
 ///
 /// Pinning itself comes with a price: it begins with a `SeqCst` fence and performs a few other
@@ -419,6 +424,8 @@ impl Drop for Guard {
 /// let guard = epoch::pin();
 /// unsafe { a.load(Relaxed, &guard).unlinked(&guard) }
 /// ```
+///
+/// [Atomic]: struct.Atomic.html
 #[inline]
 pub fn pin() -> Guard {
     HARNESS.with(|harness| {
