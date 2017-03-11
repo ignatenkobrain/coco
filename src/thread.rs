@@ -151,11 +151,32 @@ impl Thread {
     fn set_pinned(&self) -> Urgency {
         let state = STATE.load(Relaxed);
         let epoch = state & !1;
-        self.state.store(epoch, Relaxed);
 
-        // Any further loads must not precede the store. In order words, this thread's epoch must
-        // be fully announced before we load anything from the memory shared throught `Atomic`s.
-        atomic::fence(SeqCst);
+        // Now we must store `epoch` into `self.epoch`. It's important that any succeeding loads
+        // don't get reordered with this store. In order words, this thread's epoch must be fully
+        // announced to other threads. Only then it becomes safe to load from the shared memory.
+
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            // Full fence includes the StoreLoad barrier we need.
+            self.state.store(epoch, Relaxed);
+            atomic::fence(SeqCst);
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            // On x86 architectures we have a choice:
+            //
+            // 1. `atomic::fence(SeqCst)`, which compiles to a `mfence` instruction.
+            // 2. `AtomicUsize::compare_and_swap`, which compiles to a `lock cmpxchg` instruction.
+            //
+            // Both instructions have the effect of a StoreLoad barrier, but the second one seems
+            // to be faster in practice.
+            //
+            // Source: http://g.oswego.edu/dl/jmm/cookbook.html
+            let old = self.state.load(Relaxed);
+            self.state.compare_and_swap(old, epoch, SeqCst);
+        }
 
         match state & 1 {
             0 => Urgency::Normal,
@@ -356,7 +377,8 @@ impl Drop for Guard {
 ///
 /// Pinning itself comes with a price: it begins with a `SeqCst` fence and performs a few other
 /// atomic operations. However, this mechanism is designed to be as performant as possible, so it
-/// can be used pretty liberally. On a modern machine a single pinning takes around 20 nanoseconds.
+/// can be used pretty liberally. On a modern x86 machine a single pinning takes 10 to 15
+/// nanoseconds.
 ///
 /// Pinning is reentrant. There is no harm in pinning a thread while it's already pinned (repinning
 /// is essentially a noop).
