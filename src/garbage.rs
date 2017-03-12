@@ -88,7 +88,7 @@ pub struct Bag {
     /// 3. Number of objects in the array.
     objects: [(unsafe fn(*mut u8, usize), *mut u8, usize); MAX_OBJECTS],
 
-    /// The global epoch at a moment after all contained objects were unlinked.
+    /// The global epoch at the moment when this bag got pushed into the queue.
     epoch: usize,
 
     /// The next bag in the garbage queue.
@@ -222,10 +222,10 @@ impl Queue {
         }
     }
 
-    /// Pops a bag from the front of the queue and returns it if the `condition` is met.
+    /// Attempts to pop a bag from the front of the queue and returns it if the `condition` is met.
     ///
-    /// If the bag on the front doesn't meet it or if the queue is empty, `None` is returned.
-    fn pop_if<'g, F>(&self, condition: F, guard: &'g Guard) -> Option<&'g Bag>
+    /// If the bag in the front doesn't meet it or if the queue is empty, `None` is returned.
+    fn try_pop_if<'g, F>(&self, condition: F, guard: &'g Guard) -> Option<&'g Bag>
         where F: Fn(&Bag) -> bool
     {
         let mut head = self.head.load(Acquire, guard);
@@ -340,7 +340,7 @@ pub fn collect(epoch: usize, guard: &Guard) -> Urgency {
     for queue in &[normal, urgent] {
         // Collect several bags.
         for _ in 0..COLLECT_STEPS {
-            match normal.pop_if(&condition, guard) {
+            match normal.try_pop_if(&condition, guard) {
                 None => break,
                 Some(bag) => unsafe { bag.free_all_objects() },
             }

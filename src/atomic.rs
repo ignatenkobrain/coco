@@ -66,8 +66,8 @@ pub struct Atomic<T> {
     _marker: PhantomData<*const ()>, // !Send + !Sync
 }
 
-unsafe impl<T: Sync> Send for Atomic<T> {}
-unsafe impl<T: Sync> Sync for Atomic<T> {}
+unsafe impl<T: Send + Sync> Send for Atomic<T> {}
+unsafe impl<T: Send + Sync> Sync for Atomic<T> {}
 
 impl<T> Atomic<T> {
     pub fn null() -> Self {
@@ -87,6 +87,10 @@ impl<T> Atomic<T> {
 
     pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> Ptr<'g, T> {
         unsafe { Ptr::from_raw(self.ptr.load(order)) }
+    }
+
+    pub fn load_raw(&self, order: Ordering) -> *mut T {
+        self.ptr.load(order) as *mut T
     }
 
     pub fn store<'g>(&self, new: Ptr<'g, T>, order: Ordering) {

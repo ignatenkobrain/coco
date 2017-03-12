@@ -83,8 +83,8 @@ pub struct TaggedAtomic<T> {
     _marker: PhantomData<*mut T>, // !Send + !Sync
 }
 
-unsafe impl<T: Sync> Send for TaggedAtomic<T> {}
-unsafe impl<T: Sync> Sync for TaggedAtomic<T> {}
+unsafe impl<T: Send + Sync> Send for TaggedAtomic<T> {}
+unsafe impl<T: Send + Sync> Sync for TaggedAtomic<T> {}
 
 impl<T> TaggedAtomic<T> {
     unsafe fn from_data(data: usize) -> Self {
@@ -110,8 +110,9 @@ impl<T> TaggedAtomic<T> {
         unsafe { TaggedPtr::from_data(self.data.load(order)) }
     }
 
-    pub fn load_tag(&self, order: Ordering) -> usize {
-        unsafe { TaggedPtr::<T>::from_data(self.data.load(order)).tag() }
+    pub fn load_raw(&self, order: Ordering) -> (*mut T, usize) {
+        let p = unsafe { TaggedPtr::<T>::from_data(self.data.load(order)) };
+        (p.as_raw(), p.tag())
     }
 
     pub fn store<'g>(&self, new: TaggedPtr<'g, T>, order: Ordering) {
