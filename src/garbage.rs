@@ -1,5 +1,7 @@
 //! Garbage collection
 //!
+//! TODO: Explain how it relates to `Stash`.
+//!
 //! # Objects and bags
 //!
 //! Objects that get unlinked from lock-free data structures (or otherwise become unreachable) are
@@ -36,19 +38,20 @@
 //! until the urgent queue becomes empty and we return back to normal mode.
 
 use std::mem;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 
+use super::epoch;
 use super::{Atomic, Guard};
 
 /// Maximal number of objects a bag can contain.
 const MAX_OBJECTS: usize = 64;
 
 /// A bag is full when objects total at least this many bytes.
-const FULL_BYTES: usize = 1 << 16; // 16 KB
+const FULL_BYTES: usize = 1 << 16; // 16 KiB
 
 /// A bag must be urgently freed when objects total at least this many bytes.
-const URGENT_BYTES: usize = 1 << 20; // 1 MB
+const URGENT_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Number of bags per queue that are freed on each call to `collect`.
 const COLLECT_STEPS: usize = 8;
@@ -58,18 +61,6 @@ static NORMAL_QUEUE: AtomicUsize = ATOMIC_USIZE_INIT;
 
 /// The urgent garbage queue, where unusally large bags end up.
 static URGENT_QUEUE: AtomicUsize = ATOMIC_USIZE_INIT;
-
-/// State of the garbage queues.
-///
-/// Are they under control or do they need urgent collection?
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Urgency {
-    /// Normal state. No special intervention is needed.
-    Normal,
-
-    /// Urgent state. Collect aggressively until we go out of this state.
-    Urgent,
-}
 
 /// Holds unlinked objects that will be eventually freed.
 pub struct Bag {
@@ -149,14 +140,10 @@ impl Bag {
 /// The implementation is based on the typical Michael-Scott queue.
 #[repr(C)]
 struct Queue {
-    /// Head of the queue.
-    ///
-    /// The head is always a sentinel entry.
+    /// Head of the queue (always a sentinel entry).
     head: Atomic<Bag>,
-
     /// Padding to avoid false sharing.
     _pad: [u8; 64],
-
     /// Tail of the queue.
     tail: Atomic<Bag>,
 }
@@ -222,7 +209,7 @@ impl Queue {
         }
     }
 
-    /// Attempts to pop a bag from the front of the queue and returns it if the `condition` is met.
+    /// Attempts to pop a bag from the front of the queue and returns it if `condition` is met.
     ///
     /// If the bag in the front doesn't meet it or if the queue is empty, `None` is returned.
     fn try_pop_if<'g, F>(&self, condition: F, guard: &'g Guard) -> Option<&'g Bag>
@@ -305,33 +292,31 @@ fn singleton(atomic: &'static AtomicUsize) -> &'static Queue {
     unsafe { &*(queue as *const Queue) }
 }
 
-/// Pushes a bag unlinked just before `epoch` into a global queue and returns it's urgency level.
-pub fn push(mut bag: Box<Bag>, epoch: usize, guard: &Guard) -> Urgency {
-    bag.epoch = epoch;
+/// Pushes a bag into one of the global queues.
+pub fn push(mut bag: Box<Bag>, guard: &Guard) {
+    bag.epoch = epoch::load().0;
 
     if bag.total_bytes < URGENT_BYTES {
         singleton(&NORMAL_QUEUE).push(bag, guard);
-        Urgency::Normal
     } else {
         singleton(&URGENT_QUEUE).push(bag, guard);
-        Urgency::Urgent
+        epoch::set_urgency(true);
     }
 }
 
-/// Frees several bags from the queue and returns the urgency level after that.
-///
-/// The argument `epoch` is the current global epoch.
+/// Frees several bags from the queue.
 ///
 /// This function should be called when we have some cycles to spare, and it must be called at
 /// least as often as `push`. Because it collects more than one bag of garbage, the speed of
 /// collection is thus faster than the speed of garbage generation.
 #[cold]
-pub fn collect(epoch: usize, guard: &Guard) -> Urgency {
+pub fn collect(guard: &Guard) {
+    let (epoch, is_urgent) = epoch::load();
+
     let condition = |bag: &Bag| {
         // A pinned thread can witness at most two epoch advancements. Therefore, any bag that is
         // within two epochs of the current one cannot be freed yet.
-        let diff = epoch.wrapping_sub(bag.epoch);
-        diff > 4 && diff < 0usize.wrapping_sub(4)
+        epoch::distance(epoch, bag.epoch) > 2
     };
 
     let normal = singleton(&NORMAL_QUEUE);
@@ -347,8 +332,14 @@ pub fn collect(epoch: usize, guard: &Guard) -> Urgency {
         }
     }
 
-    match urgent.is_empty(guard) {
-        true => Urgency::Normal,
-        false => Urgency::Urgent,
+    // Did we just resolve the urgency? If so, clear the urgency flag.
+    if is_urgent && urgent.is_empty(guard) {
+        epoch::set_urgency(false);
+
+        // Did some other thread just push a new bag into the urgent queue? If so, switch back to
+        // urgency mode.
+        if !urgent.is_empty(guard) {
+            epoch::set_urgency(true);
+        }
     }
 }

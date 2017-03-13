@@ -1,16 +1,5 @@
 //! Thread synchronization and pinning
 //!
-//! # The global epoch
-//!
-//! The global `STATE` number holds two pieces of data: the current global epoch and whether
-//! garbage needs to be urgently collected. Every so often the global epoch is incremented - we say
-//! it "advances". It can advance only if all currently pinned threads have been pinned in the
-//! current epoch.
-//!
-//! If an object became unreachable in some epoch, we can be sure that no thread will hold a
-//! reference to it after two epoch advancements - that is the moment when it will be safe to free
-//! it's memory.
-//!
 //! # Registration
 //!
 //! In order to track all threads in one place, we need some form of thread registration. Every
@@ -24,9 +13,9 @@
 //! tells whether the thread is pinned and if so, what was the global epoch at the time it was
 //! pinned.
 //!
-//! # Stashing garbage
+//! # Garbage reclamation
 //!
-//! If a pinned thread wants to stash away an unlinked object to free it's memory at a later safe
+//! If a pinned thread wants to reclaim an unlinked object by freeing it's memory at a later safe
 //! time, it will store it in it's thread-local bag. If the local bag is full, it must first be
 //! replaced with a fresh one. The old bag is then pushed into a global garbage queue and marked
 //! with the current epoch.
@@ -41,23 +30,9 @@ use std::ptr;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{self, AtomicUsize, ATOMIC_USIZE_INIT};
 
-use super::garbage::{self, Bag, Urgency};
+use super::epoch;
+use super::garbage::{self, Bag};
 use super::{Atomic, Ptr, TaggedAtomic, TaggedPtr};
-
-/// The global state (epoch and urgency).
-///
-/// The last bit in this number indicates that garbage must be urgently collected, and the rest of
-/// the bits encode the current global epoch, which is always an even number.
-///
-/// More precisely:
-///
-/// * Urgency: `state & 1 == 1`
-/// * Epoch: `state & !1`
-///
-/// The global epoch is advanced by increasing the state by 2, and wrapping it around on overflow.
-/// A pinned thread may advance the epoch only if all pinned threads have been pinned with the
-/// current epoch.
-static STATE: AtomicUsize = ATOMIC_USIZE_INIT;
 
 /// Head pointer to the singly-linked list of participating threads.
 ///
@@ -87,10 +62,8 @@ thread_local! {
 struct Harness {
     /// This thread's entry in the participants list.
     thread: *const Thread,
-
     /// Number of pending uses of `pin()`.
     pin_count: Cell<usize>,
-
     /// The local bag of unlinked objects.
     bag: Cell<*mut Bag>,
 }
@@ -103,20 +76,17 @@ impl Drop for Harness {
 
         // If we called `pin()` here, it would try to access `HARNESS` and then panic.
         // To work around the problem, we manually pin the thread.
-        thread.set_pinned();
         let guard = Guard { harness: self };
+        thread.set_pinned(&guard);
 
         // Spare some cycles on garbage collection.
         // Note: this may itself produce garbage and in turn allocate new bags.
-        advance(&guard);
-        let epoch = STATE.load(SeqCst) & !1;
-        garbage::collect(epoch, &guard);
+        try_advance(&guard);
+        garbage::collect(&guard);
 
         // Push the local bag into a garbage queue.
         let bag = unsafe { Box::from_raw(self.bag.get()) };
-        if garbage::push(bag, epoch, &guard) == Urgency::Urgent {
-            STATE.fetch_or(1, SeqCst);
-        }
+        garbage::push(bag, &guard);
 
         // Forget the guard and manually unpin the thread.
         mem::forget(guard);
@@ -144,43 +114,47 @@ struct Thread {
 }
 
 impl Thread {
-    /// Marks the thread as pinned and returns the global epoch just before pinning.
+    /// Marks the thread as pinned.
     ///
     /// Must not be called if the thread is already pinned!
     #[inline]
-    fn set_pinned(&self) -> Urgency {
-        let state = STATE.load(Relaxed);
-        let epoch = state & !1;
-
-        // Now we must store `epoch` into `self.epoch`. It's important that any succeeding loads
-        // don't get reordered with this store. In order words, this thread's epoch must be fully
-        // announced to other threads. Only then it becomes safe to load from the shared memory.
-
+    fn set_pinned(&self, guard: &Guard) {
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
+        fn store_with_fence(dest: &AtomicUsize, value: usize) {
             // Full fence includes the StoreLoad barrier we need.
-            self.state.store(epoch, Relaxed);
+            dest.store(value, Relaxed);
             atomic::fence(SeqCst);
         }
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
+        fn store_with_fence(dest: &AtomicUsize, value: usize) {
             // On x86 architectures we have a choice:
             //
             // 1. `atomic::fence(SeqCst)`, which compiles to a `mfence` instruction.
-            // 2. `AtomicUsize::compare_and_swap`, which compiles to a `lock cmpxchg` instruction.
+            // 2. `compare_and_swap(_, _, SeqCst)`, which compiles to a `lock cmpxchg` instruction.
             //
             // Both instructions have the effect of a StoreLoad barrier, but the second one seems
             // to be faster in practice.
             //
             // Source: http://g.oswego.edu/dl/jmm/cookbook.html
-            let old = self.state.load(Relaxed);
-            self.state.compare_and_swap(old, epoch, SeqCst);
+            let old = dest.load(Relaxed);
+            dest.compare_and_swap(old, value, SeqCst);
         }
 
-        match state & 1 {
-            0 => Urgency::Normal,
-            _ => Urgency::Urgent,
+        let (epoch, is_urgent) = epoch::load();
+        // Now we must store `epoch` into `self.epoch`. It's important that any succeeding loads
+        // don't get reordered with this store. In order words, this thread's epoch must be fully
+        // announced to other threads. Only then it becomes safe to load from the shared memory.
+        store_with_fence(&self.state, epoch);
+
+        if is_urgent {
+            // Try advancing the epoch and collecting some garbage.
+            try_advance(&guard);
+            garbage::collect(&guard);
+
+            // Store a freshly loaded epoch in order to help advance it as quickly as possible.
+            let (epoch, _) = epoch::load();
+            store_with_fence(&self.state, epoch);
         }
     }
 
@@ -188,8 +162,7 @@ impl Thread {
     #[inline]
     fn set_unpinned(&self) {
         // Nothing special about number 1, any odd number marks the thread as unpinned.
-        atomic::fence(Release);
-        self.state.store(1, Relaxed);
+        self.state.store(1, Release);
     }
 
     /// Registers a thread by adding a new entry to the list of participanting threads.
@@ -232,7 +205,7 @@ impl Thread {
     /// Unregisters the thread by marking it's entry as deleted.
     ///
     /// This function doesn't physically remove the entry from the linked list, though. That will
-    /// do any future call to `advance`.
+    /// do any future call to `try_advance`.
     fn unregister(&self) {
         // This code is executing while the thread harness is initializing, so normal pinning would
         // try to access it while it is being initialized. Such accesses fail with a panic. We must
@@ -263,9 +236,8 @@ fn participants() -> &'static TaggedAtomic<Thread> {
 /// The global epoch can advance only if all currently pinned threads have been pinned in the
 /// current epoch.
 #[cold]
-fn advance(guard: &Guard) {
-    let state = STATE.load(SeqCst);
-    let epoch = state & !1;
+fn try_advance(guard: &Guard) {
+    let (epoch, _) = epoch::load();
 
     // Traverse the linked list of participating threads.
     let mut pred = participants();
@@ -292,7 +264,7 @@ fn advance(guard: &Guard) {
             curr = succ;
         } else {
             let thread_state = c.state.load(SeqCst);
-            let thread_is_pinned = thread_state & 1 == 0;
+            let thread_is_pinned = thread_state & 1 == 0; // TODO: maybe flip this bit?
             let thread_epoch = thread_state & !1;
 
             // If the thread was pinned in a different epoch, we cannot advance the global epoch
@@ -309,7 +281,7 @@ fn advance(guard: &Guard) {
 
     // All pinned threads were pinned in the current global epoch.
     // Finally, try advancing the epoch. We increment by 2 and simply wrap around on overflow.
-    STATE.compare_and_swap(state, state.wrapping_add(2), SeqCst);
+    epoch::try_advance(epoch);
 }
 
 /// A witness that the current thread is pinned.
@@ -430,28 +402,14 @@ impl Drop for Guard {
 pub fn pin() -> Guard {
     HARNESS.with(|harness| {
         let thread = unsafe { &*harness.thread };
-        let guard = Guard { harness: harness };
-
         let c = harness.pin_count.get();
-        harness.pin_count.set(c + 1);
+        // In theory, the counter can overflow if we repeatedly `mem::forget` a lot of guards.
+        harness.pin_count.set(c.checked_add(1).unwrap());
 
-        if c == 0 && thread.set_pinned() == Urgency::Urgent {
-            // Try advancing the epoch and collecting some garbage.
-            advance(&guard);
-
-            let state = STATE.load(SeqCst);
-            let epoch = state & !1;
-
-            if garbage::collect(epoch, &guard) == Urgency::Normal {
-                // Clear the urgency flag.
-                STATE.compare_and_swap(state, epoch & !1, SeqCst);
-            }
-
-            // Unpin and pin again, in order to help advance the epoch as quickly as possible.
-            thread.set_unpinned();
-            thread.set_pinned();
+        let guard = Guard { harness: harness };
+        if c == 0 {
+            thread.set_pinned(&guard);
         }
-
         guard
     })
 }
@@ -482,14 +440,11 @@ pub unsafe fn unlinked<T>(value: *mut T, count: usize, guard: &Guard) {
         cell.set(Box::into_raw(Box::new(Bag::new())));
 
         // Spare some cycles on garbage collection.
-        advance(guard);
-        let epoch = STATE.load(SeqCst) & !1;
-        garbage::collect(epoch, guard);
+        try_advance(guard);
+        garbage::collect(guard);
 
         // Finally, push the old bag into the garbage queue.
         let bag = unsafe { Box::from_raw(bag) };
-        if garbage::push(bag, epoch, guard) == Urgency::Urgent {
-            STATE.fetch_or(1, SeqCst);
-        }
+        garbage::push(bag, guard);
     }
 }
