@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 use std::ops::Deref;
 
-use super::Guard;
+use super::Pin;
 
-pub struct TaggedPtr<'g, T: 'g> {
+pub struct TaggedPtr<'p, T: 'p> {
     data: usize,
-    _marker: PhantomData<(*mut T, &'g T)>, // !Send + !Sync
+    _marker: PhantomData<(*mut T, &'p T)>, // !Send + !Sync
 }
 
 impl<'a, T> Clone for TaggedPtr<'a, T> {
@@ -33,7 +33,7 @@ fn raw_and_tag<T>(raw: *mut T, tag: usize) -> usize {
     raw as usize | tag
 }
 
-impl<'g, T: 'g> TaggedPtr<'g, T> {
+impl<'p, T: 'p> TaggedPtr<'p, T> {
     unsafe fn from_data(data: usize) -> Self {
         TaggedPtr {
             data: data,
@@ -53,7 +53,7 @@ impl<'g, T: 'g> TaggedPtr<'g, T> {
         self.as_raw().is_null()
     }
 
-    pub fn as_ref(&self) -> Option<&'g T> {
+    pub fn as_ref(&self) -> Option<&'p T> {
         unsafe { self.as_raw().as_ref() }
     }
 
@@ -61,7 +61,7 @@ impl<'g, T: 'g> TaggedPtr<'g, T> {
         (self.data & !low_bits::<T>()) as *mut T
     }
 
-    pub fn unwrap(&self) -> &'g T {
+    pub fn unwrap(&self) -> &'p T {
         self.as_ref().unwrap()
     }
 
@@ -73,8 +73,8 @@ impl<'g, T: 'g> TaggedPtr<'g, T> {
         unsafe { Self::from_raw(self.as_raw(), tag) }
     }
 
-    pub unsafe fn unlinked(&self, guard: &'g Guard) {
-        self.as_ref().map(|r| super::unlinked(r as *const _ as *mut T, 1, guard));
+    pub unsafe fn defer_free(&self, pin: &'p Pin) {
+        self.as_ref().map(|r| super::defer_free(r as *const _ as *mut T, 1, pin));
     }
 }
 
@@ -106,7 +106,7 @@ impl<T> TaggedAtomic<T> {
         Self::from_data(raw_and_tag(raw, tag))
     }
 
-    pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> TaggedPtr<'g, T> {
+    pub fn load<'p>(&self, order: Ordering, _: &'p Pin) -> TaggedPtr<'p, T> {
         unsafe { TaggedPtr::from_data(self.data.load(order)) }
     }
 
@@ -115,19 +115,19 @@ impl<T> TaggedAtomic<T> {
         (p.as_raw(), p.tag())
     }
 
-    pub fn store<'g>(&self, new: TaggedPtr<'g, T>, order: Ordering) {
+    pub fn store<'p>(&self, new: TaggedPtr<'p, T>, order: Ordering) {
         self.data.store(new.data, order);
     }
 
-    pub fn store_box<'g>(&self, new: Box<T>, tag: usize, order: Ordering, guard: &'g Guard)
-                         -> TaggedPtr<'g, T> {
+    pub fn store_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, pin: &'p Pin)
+                         -> TaggedPtr<'p, T> {
         let r = unsafe { TaggedPtr::from_raw(Box::into_raw(new), tag) };
         self.data.store(r.data, order);
         r
     }
 
-    pub fn cas<'g>(&self, current: TaggedPtr<'g, T>, new: TaggedPtr<'g, T>, order: Ordering)
-                   -> Result<(), TaggedPtr<'g, T>> {
+    pub fn cas<'p>(&self, current: TaggedPtr<'p, T>, new: TaggedPtr<'p, T>, order: Ordering)
+                   -> Result<(), TaggedPtr<'p, T>> {
         let previous = self.data.compare_and_swap(current.data, new.data, order);
         if previous == current.data {
             Ok(())
@@ -136,8 +136,8 @@ impl<T> TaggedAtomic<T> {
         }
     }
 
-    pub fn cas_weak<'g>(&self, current: TaggedPtr<'g, T>, new: TaggedPtr<'g, T>, order: Ordering)
-                        -> Result<(), TaggedPtr<'g, T>> {
+    pub fn cas_weak<'p>(&self, current: TaggedPtr<'p, T>, new: TaggedPtr<'p, T>, order: Ordering)
+                        -> Result<(), TaggedPtr<'p, T>> {
         let failure_order = match order {
             AcqRel => Acquire,
             Release => Relaxed,
@@ -149,9 +149,9 @@ impl<T> TaggedAtomic<T> {
         }
     }
 
-    pub fn cas_box<'g>(&self, current: TaggedPtr<'g, T>, mut new: Box<T>, tag: usize,
+    pub fn cas_box<'p>(&self, current: TaggedPtr<'p, T>, mut new: Box<T>, tag: usize,
                        order: Ordering)
-                       -> Result<TaggedPtr<'g, T>, (TaggedPtr<'g, T>, Box<T>)> {
+                       -> Result<TaggedPtr<'p, T>, (TaggedPtr<'p, T>, Box<T>)> {
         let new_data = raw_and_tag(new.as_mut(), tag);
         let previous = self.data.compare_and_swap(current.data, new_data, order);
         if previous == current.data {
@@ -162,9 +162,9 @@ impl<T> TaggedAtomic<T> {
         }
     }
 
-    pub fn cas_box_weak<'g>(&self, current: TaggedPtr<'g, T>, mut new: Box<T>, tag: usize,
+    pub fn cas_box_weak<'p>(&self, current: TaggedPtr<'p, T>, mut new: Box<T>, tag: usize,
                             order: Ordering)
-                            -> Result<TaggedPtr<'g, T>, (TaggedPtr<'g, T>, Box<T>)> {
+                            -> Result<TaggedPtr<'p, T>, (TaggedPtr<'p, T>, Box<T>)> {
         let failure_order = match order {
             AcqRel => Acquire,
             Release => Relaxed,

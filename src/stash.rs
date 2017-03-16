@@ -8,7 +8,7 @@ use std::sync::atomic::{self, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 use super::epoch;
-use super::{Atomic, Guard, Ptr};
+use super::{Atomic, Pin, Ptr};
 
 /// TODO
 const MAX_OBJECTS: usize = 64;
@@ -88,23 +88,27 @@ impl Stash {
     }
 
     /// TODO: a note on lifetime of T
-    pub unsafe fn put<T>(&self, object: *mut T, guard: &Guard)
-        where T: Send + Sync
+    // TODO: a note on send + sync
+    pub unsafe fn defer_drop<T>(&self, object: *mut T, guard: &Pin)
     {
         unsafe fn dtor<T>(ptr: *mut u8) {
             // Execute destructor and free the memory.
             drop(Vec::from_raw_parts(ptr as *mut T, 1, 1));
         }
-        self.put_with_destructor(dtor::<T>, object as *mut u8, guard);
+        self.defer_destroy(dtor::<T>, object as *mut u8, guard);
     }
 
     /// TODO
-    pub unsafe fn put_with_destructor(
+    // TODO: a note on send + sync
+    pub unsafe fn defer_destroy<T>(
         &self,
-        dtor: unsafe fn(*mut u8),
-        object: *mut u8,
-        guard: &Guard
+        dtor: unsafe fn(*mut T),
+        object: *mut T,
+        guard: &Pin
     ) {
+        let dtor: unsafe fn(*mut u8) = unsafe { mem::transmute(dtor) };
+        let object = object as *mut u8;
+
         loop {
             let pending = self.pending.load(Acquire, guard);
 
@@ -137,7 +141,7 @@ impl Stash {
     }
 
     /// TODO: how often should we call this? (in theory, never)
-    pub fn collect(&self, guard: &Guard) {
+    pub fn collect(&self, guard: &Pin) {
         let epoch = epoch::load().0;
 
         let condition = |node: &Node| {
@@ -157,7 +161,7 @@ impl Stash {
     /// Pushes a node into the queue.
     ///
     /// The bag must be marked with an epoch beforehand. TODO
-    fn push_node(&self, mut node: Box<Node>, guard: &Guard) {
+    fn push_node(&self, mut node: Box<Node>, guard: &Pin) {
         let mut tail = self.tail.load(Acquire, guard);
         loop {
             let next = tail.unwrap().next.load(Acquire, guard);
@@ -188,7 +192,7 @@ impl Stash {
     /// Attempts to pop a node from the front of the queue and returns it if `condition` is met.
     ///
     /// If the node in the front doesn't meet it or if the queue is empty, `None` is returned.
-    fn try_pop_if<'g, F>(&self, condition: F, guard: &'g Guard) -> Option<&'g Node>
+    fn try_pop_if<'p, F>(&self, condition: F, guard: &'p Pin) -> Option<&'p Node>
         where F: Fn(&Node) -> bool
     {
         let mut head = self.head.load(Acquire, guard);
@@ -200,7 +204,7 @@ impl Stash {
                     // Try unlinking the head by moving it forward.
                     match self.head.cas_weak(head, next, AcqRel) {
                         Ok(()) => {
-                            unsafe { head.unlinked(guard) }
+                            unsafe { head.defer_free(guard) }
                             // The unlinked head was just a sentinel.
                             // It's successor is the real head.
                             return Some(n);

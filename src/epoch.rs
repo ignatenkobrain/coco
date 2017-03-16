@@ -35,6 +35,11 @@ pub fn load() -> (usize, bool) {
     (state & !1, state & 1 == 1)
 }
 
+#[inline]
+pub fn load_relaxed() -> usize {
+    STATE.load(Relaxed)
+}
+
 /// Enables or disables the urgency mode.
 #[inline]
 pub fn set_urgency(is_urgent: bool) {
