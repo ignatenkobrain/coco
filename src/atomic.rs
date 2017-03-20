@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 use std::ops::Deref;
 
-use super::Pin;
+use Pin;
 
 // TODO: derive Debug on public structs
 // TODO: impl Default
@@ -52,12 +52,6 @@ impl<'p, T> Ptr<'p, T> {
 
     pub fn unwrap(&self) -> &'p T {
         self.as_ref().unwrap()
-    }
-
-    pub unsafe fn defer_free(&self, pin: &'p Pin) {
-        if !self.ptr.is_null() {
-            super::defer_free(self.ptr, 1, pin);
-        }
     }
 }
 

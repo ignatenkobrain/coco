@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 use std::ops::Deref;
 
-use super::Pin;
+use Pin;
 
 pub struct TaggedPtr<'p, T: 'p> {
     data: usize,
@@ -71,10 +71,6 @@ impl<'p, T: 'p> TaggedPtr<'p, T> {
 
     pub fn with_tag(&self, tag: usize) -> Self {
         unsafe { Self::from_raw(self.as_raw(), tag) }
-    }
-
-    pub unsafe fn defer_free(&self, pin: &'p Pin) {
-        self.as_ref().map(|r| super::defer_free(r as *const _ as *mut T, 1, pin));
     }
 }
 
