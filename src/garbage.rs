@@ -46,7 +46,7 @@ const COLLECT_STEPS: usize = 8;
 /// all currently pinned threads have been pinned in the current epoch.
 ///
 /// If an object became garbage in some epoch, then we can be sure that after two advancements no
-/// thread will hold a reference to it. This is the crux of safe memory reclamation.
+/// thread will hold a reference to it. That is the crux of safe memory reclamation.
 pub static EPOCH: AtomicUsize = ATOMIC_USIZE_INIT;
 
 /// Holds removed objects that will be eventually destroyed.
@@ -109,7 +109,7 @@ impl Bag {
     unsafe fn destroy_all_objects(&self) {
         for cell in self.objects.iter().take(self.len.load(Relaxed)) {
             let (destroy, object) = *cell.get();
-            unsafe { destroy(object) }
+            destroy(object);
         }
     }
 }
@@ -118,11 +118,11 @@ impl Bag {
 ///
 /// This is where a concurrent data structure can store removed objects for deferred destruction.
 pub struct Garbage {
-    /// Head of the queue (always a sentinel entry).
+    /// Head of the queue.
     head: Atomic<Bag>,
     /// Tail of the queue.
     tail: Atomic<Bag>,
-    /// The next bag that will be pushed into the queue, as soon as it gets full.
+    /// The next bag that will be pushed into the queue as soon as it gets full.
     pending: Atomic<Bag>,
 }
 
@@ -137,7 +137,7 @@ impl Garbage {
 
         // This code may be executing while a thread harness is initializing, so normal pinning
         // would try to access it while it is being initialized. Such accesses fail with a panic.
-        // We cheat our way around this by creating a fake pin.
+        // We must therefore cheat by creating a fake pin.
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
         // The head of the queue is always a sentinel entry.
@@ -176,12 +176,15 @@ impl Garbage {
         object: *mut T,
         pin: &Pin
     ) {
+        let mut pending = self.pending.load(Acquire, pin);
         loop {
-            let pending = self.pending.load(Acquire, pin);
             match pending.as_ref() {
                 None => {
                     // There is no pending bag. Try installing a fresh one.
-                    self.pending.cas_box(pending, Box::new(Bag::new()), Release);
+                    match self.pending.cas_box(pending, Box::new(Bag::new()), AcqRel) {
+                        Ok(p) => pending = p,
+                        Err((p, _)) => pending = p,
+                    }
                 }
                 Some(p) => {
                     if p.try_insert(destroy, object) {
@@ -192,7 +195,7 @@ impl Garbage {
                         // pushing the old one into the queue.
                         if self.pending.cas_box(pending, Box::new(Bag::new()), AcqRel).is_ok() {
                             // Success! Push the bag into the queue and collect some garbage.
-                            let mut bag = unsafe { Box::from_raw(pending.as_raw()) };
+                            let bag = Box::from_raw(pending.as_raw());
                             self.push(bag, pin);
                             self.collect(pin);
                         }
@@ -237,7 +240,7 @@ impl Garbage {
                 match tail.unwrap().next.cas_box_weak(next, bag, AcqRel) {
                     Ok(bag) => {
                         // Tail pointer shouldn't fall behind. Let's move it forward.
-                        self.tail.cas(tail, bag, Release);
+                        let _ = self.tail.cas(tail, bag, Release);
                         break;
                     }
                     Err((t, b)) => {
@@ -288,8 +291,10 @@ impl Drop for Garbage {
         unsafe {
             // Load the pending bag, then destroy it and all it's objects.
             let pending = self.pending.load_raw(Relaxed);
-            (*pending).destroy_all_objects();
-            drop(Box::from_raw(pending));
+            if !pending.is_null() {
+                (*pending).destroy_all_objects();
+                drop(Box::from_raw(pending));
+            }
 
             // Destroy all bags and objects in the queue.
             let mut head = self.head.load_raw(Relaxed);
@@ -347,7 +352,6 @@ pub fn push(bag: Box<Bag>, pin: &Pin) {
 }
 
 /// Collects several bags from the global queue and destroys their objects.
-#[cold]
 pub fn collect(pin: &Pin) {
     global().collect(pin);
 }

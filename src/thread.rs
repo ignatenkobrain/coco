@@ -17,11 +17,10 @@
 
 use std::cell::Cell;
 use std::mem;
-use std::ptr;
-use std::sync::atomic::{self, AtomicUsize, ATOMIC_USIZE_INIT};
-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst};
+use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use {Atomic, Ptr, TaggedAtomic, TaggedPtr};
+use TaggedAtomic;
 use garbage::{self, Bag, EPOCH};
 
 /// Number of pinnings after which a thread will collect some global garbage.
@@ -96,7 +95,7 @@ impl Thread {
     ///
     /// Must not be called if the thread is already pinned!
     #[inline]
-    fn set_pinned(&self, pin: &Pin) {
+    fn set_pinned(&self, _pin: &Pin) {
         let epoch = EPOCH.load(Relaxed);
         // Now we must store `epoch` into `self.state`. It's important that any succeeding loads
         // don't get reordered with this store. In order words, this thread's epoch must be fully
@@ -106,7 +105,7 @@ impl Thread {
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         fn store_with_fence(dest: &AtomicUsize, value: usize) {
             dest.store(value, Relaxed);
-            atomic::fence(SeqCst);
+            ::std::sync::atomic::fence(SeqCst);
         }
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -208,7 +207,7 @@ fn try_advance(pin: &Pin) {
             let succ = succ.with_tag(0);
 
             if pred.cas(curr, succ, Release).is_err() {
-                // We lost the race to unlink the thread. Usually this means we should traverse the
+                // We lost the race to unlink the thread. Usually that means we should traverse the
                 // list again from the beginning, but since another thread trying to advance the
                 // epoch has won the race, we leave the job to that one.
                 return;
@@ -347,7 +346,7 @@ pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {
         garbage::collect(pin);
 
         // Finally, push the old bag into the garbage queue.
-        let bag = unsafe { Box::from_raw(bag) };
+        let bag = Box::from_raw(bag);
         garbage::push(bag, pin);
     }
 }

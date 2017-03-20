@@ -1,9 +1,8 @@
 use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
-use std::ops::Deref;
 
 use Pin;
 
@@ -115,7 +114,7 @@ impl<T> TaggedAtomic<T> {
         self.data.store(new.data, order);
     }
 
-    pub fn store_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, pin: &'p Pin)
+    pub fn store_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, _pin: &'p Pin)
                          -> TaggedPtr<'p, T> {
         let r = unsafe { TaggedPtr::from_raw(Box::into_raw(new), tag) };
         self.data.store(r.data, order);

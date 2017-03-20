@@ -1,14 +1,13 @@
-use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicUsize};
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
-use std::ops::Deref;
 
 use Pin;
 
 // TODO: derive Debug on public structs
 // TODO: impl Default
+// TODO: swap method
 
 pub struct Ptr<'p, T: 'p> {
     ptr: *mut T, // !Send + !Sync
@@ -91,7 +90,7 @@ impl<T> Atomic<T> {
         self.ptr.store(new.ptr, order);
     }
 
-    pub fn store_box<'p>(&self, new: Box<T>, order: Ordering, pin: &'p Pin) -> Ptr<'p, T> {
+    pub fn store_box<'p>(&self, new: Box<T>, order: Ordering, _pin: &'p Pin) -> Ptr<'p, T> {
         let r = unsafe { Ptr::from_raw(Box::into_raw(new)) };
         self.ptr.store(r.ptr, order);
         r
