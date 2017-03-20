@@ -318,7 +318,7 @@ pub struct Pin {
 ///
 ///     // The old value is not reachable anymore.
 ///     // The piece of memory it owns will be reclaimed at a later time.
-///     unsafe { old.unlinked(pin) }
+///     unsafe { epoch::defer_free(old.as_raw(), pin) }
 ///
 ///     // Load the atomic again.
 ///     let new = a.load(Relaxed, pin);
@@ -326,8 +326,10 @@ pub struct Pin {
 /// });
 ///
 /// // When `Atomic` gets destructed, it doesn't do anything with the object it references.
-/// // We must announce that it got unlinked, otherwise memory gets leaked.
-/// unsafe { epoch::pin(|pin| a.load(Relaxed, pin).unlinked(pin)) }
+/// // We must stash away the garbage we produce.
+/// epoch::pin(|pin| unsafe {
+///     epoch::defer_free(a.load(Relaxed, pin).as_raw(), pin)
+/// })
 /// ```
 ///
 /// [`Atomic`]: struct.Atomic.html
