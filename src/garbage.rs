@@ -49,15 +49,6 @@ const COLLECT_STEPS: usize = 8;
 /// thread will hold a reference to it. This is the crux of safe memory reclamation.
 pub static EPOCH: AtomicUsize = ATOMIC_USIZE_INIT;
 
-/// Returns the distance between two epochs.
-///
-/// For example, distance between adjacent epochs is 1.
-#[inline]
-pub fn distance(epoch1: usize, epoch2: usize) -> usize {
-    let diff = epoch1.wrapping_sub(epoch2);
-    cmp::min(diff, 0usize.wrapping_sub(diff)) / 2
-}
-
 /// Holds removed objects that will be eventually destroyed.
 pub struct Bag {
     /// Number of objects in the bag.
@@ -221,7 +212,8 @@ impl Garbage {
         let condition = |bag: &Bag| {
             // A pinned thread can witness at most two epoch advancements. Therefore, any bag that
             // is within two epochs of the current one cannot be destroyed yet.
-            distance(epoch, bag.epoch) > 2
+            let diff = epoch.wrapping_sub(bag.epoch);
+            cmp::min(diff, 0usize.wrapping_sub(diff)) > 4
         };
 
         for _ in 0..COLLECT_STEPS {
@@ -293,14 +285,32 @@ impl Garbage {
 
 impl Drop for Garbage {
     fn drop(&mut self) {
-        // This code may be executing while a thread harness is initializing, so normal pinning
-        // would try to access it while it is being initialized. Such accesses fail with a panic.
-        // We cheat our way around this by creating a fake pin.
-        let pin = unsafe { &mem::zeroed::<Pin>() };
+        unsafe {
+            // Load the pending bag, then destroy it and all it's objects.
+            let pending = self.pending.load_raw(Relaxed);
+            (*pending).destroy_all_objects();
+            drop(Box::from_raw(pending));
 
-        // TODO: pending bag (may be null) - CAS it!
-        // TODO: go in windows of 1 nodes
-        // TODO: CAS the head!
+            // Destroy all bags and objects in the queue.
+            let mut head = self.head.load_raw(Relaxed);
+            loop {
+                // Load the next bag and destroy the current head.
+                let next = (*head).next.load_raw(Relaxed);
+                drop(Box::from_raw(head));
+
+                // If the next node is null, we've reached the end of the queue.
+                if next.is_null() {
+                    break;
+                }
+
+                // Move one step forward.
+                head = next;
+
+                // Destroy all objects in this bag.
+                // The bag itself will be destroyed in the next iteration of the loop.
+                (*head).destroy_all_objects();
+            }
+        }
     }
 }
 

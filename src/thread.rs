@@ -250,25 +250,6 @@ fn try_advance(pin: &Pin) {
 /// This data type is inherently bound to the thread that created it, therefore it does not
 /// implement `Send` nor `Sync`.
 ///
-/// # Examples
-///
-/// ```
-/// use epoch::{self, Pin, Atomic};
-/// use std::sync::atomic::Ordering::SeqCst;
-///
-/// struct Foo(Atomic<String>);
-///
-/// impl Foo {
-///     fn get<'p>(&self, pin: &'p Pin) -> &'p str {
-///         self.0.load(SeqCst, pin).unwrap()
-///     }
-/// }
-///
-/// let foo = Foo(Atomic::new("hello".to_string()));
-///
-/// epoch::pin(|pin| assert_eq!(foo.get(pin), "hello"));
-/// ```
-///
 /// [`Atomic`]: struct.Atomic.html
 #[derive(Debug)]
 pub struct Pin {
@@ -296,41 +277,6 @@ pub struct Pin {
 ///
 /// Pinning is reentrant. There is no harm in pinning a thread while it's already pinned (repinning
 /// is essentially a noop).
-///
-/// # Examples
-///
-/// ```
-/// use epoch::Atomic;
-/// use std::sync::Arc;
-/// use std::sync::atomic::Ordering::Relaxed;
-/// use std::thread;
-///
-/// // Create a shared heap-allocated integer.
-/// let a = Atomic::new(10);
-///
-/// epoch::pin(|pin| {
-///     // Load the atomic.
-///     let old = a.load(Relaxed, pin);
-///     assert_eq!(*old.unwrap(), 10);
-///
-///     // Store a new heap-allocated integer in it's place.
-///     a.store_box(Box::new(20), Relaxed, pin);
-///
-///     // The old value is not reachable anymore.
-///     // The piece of memory it owns will be reclaimed at a later time.
-///     unsafe { epoch::defer_free(old.as_raw(), pin) }
-///
-///     // Load the atomic again.
-///     let new = a.load(Relaxed, pin);
-///     assert_eq!(*new.unwrap(), 20);
-/// });
-///
-/// // When `Atomic` gets destructed, it doesn't do anything with the object it references.
-/// // We must stash away the garbage we produce.
-/// epoch::pin(|pin| unsafe {
-///     epoch::defer_free(a.load(Relaxed, pin).as_raw(), pin)
-/// })
-/// ```
 ///
 /// [`Atomic`]: struct.Atomic.html
 pub fn pin<F, T>(f: F) -> T
@@ -382,14 +328,17 @@ pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {
     }
 
     loop {
+        // Get the thread-local bag.
         let cell = &*pin.bag;
         let bag = cell.get();
 
+        // Try inserting the object into the bag.
         if (*bag).try_insert(free::<T>, object) {
+            // Success! We're done.
             break;
         }
 
-        // Replace the bag with a fresh one.
+        // The bag is full. We must replace it with a fresh one.
         cell.set(Box::into_raw(Box::new(Bag::new())));
 
         // Spare some cycles on garbage collection.
