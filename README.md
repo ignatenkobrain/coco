@@ -7,8 +7,9 @@
 
 This is a set of concurrent collections in Rust.
 
-The library draws inspiration from [Crossbeam][crossbeam] and
-[java.util.concurrent][juc].
+The library draws inspiration from [Crossbeam][crossbeam], [libcds][libcds],
+and [java.util.concurrent][juc].
 
 [crossbeam]: https://github.com/crossbeam-rs/crossbeam
+[libcds]: https://github.com/khizmax/libcds
 [juc]: https://docs.oracle.com/javase/8/docs/api/?java/util/concurrent/package-summary.html
