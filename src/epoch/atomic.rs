@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 
-use Pin;
+use epoch::Pin;
 
 /// An atomic nullable pointer.
 #[derive(Debug)]

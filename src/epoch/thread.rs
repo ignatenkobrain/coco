@@ -20,8 +20,8 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use TaggedAtomic;
-use garbage::{self, Bag, EPOCH};
+use epoch::TaggedAtomic;
+use epoch::garbage::{self, Bag, EPOCH};
 
 thread_local! {
     /// The thread registration harness.

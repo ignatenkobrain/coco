@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 
-use Pin;
+use epoch::Pin;
 
 /// Returns the number of unused least significant bits of a pointer to `T`.
 fn low_bits<T>() -> usize {

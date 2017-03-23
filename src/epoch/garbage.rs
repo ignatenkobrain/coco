@@ -32,7 +32,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use {Atomic, Pin, defer_free};
+use epoch::{Atomic, Pin, defer_free};
 
 /// Maximum number of objects a bag can contain.
 const MAX_OBJECTS: usize = 64;
