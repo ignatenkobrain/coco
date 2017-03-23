@@ -273,7 +273,7 @@ impl Garbage {
                     // Try moving the head forward.
                     match self.head.cas_weak(head, next, AcqRel) {
                         Ok(()) => {
-                            // The old head may later be freed.
+                            // The old head may be later freed.
                             unsafe { defer_free(head.as_raw(), pin) }
                             // The new head holds the popped value (heads are sentinels!).
                             return Some(n);

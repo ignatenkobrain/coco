@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 
 use epoch::Pin;
 
-/// Returns the number of unused least significant bits of a pointer to `T`.
+/// Returns a mask containing unused least significant bits of an aligned pointer to `T`.
 fn low_bits<T>() -> usize {
     (1 << mem::align_of::<T>().trailing_zeros()) - 1
 }
