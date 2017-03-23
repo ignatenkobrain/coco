@@ -328,7 +328,10 @@ impl<T> TaggedAtomic<T> {
 
 impl<T> Default for TaggedAtomic<T> {
     fn default() -> Self {
-        Self::null(0)
+        TaggedAtomic {
+            data: AtomicUsize::new(0),
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -419,6 +422,9 @@ impl<'p, T: 'p> TaggedPtr<'p, T> {
 
 impl<'p, T> Default for TaggedPtr<'p, T> {
     fn default() -> Self {
-        Self::null(0)
+        TaggedPtr {
+            data: 0,
+            _marker: PhantomData,
+        }
     }
 }
