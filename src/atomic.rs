@@ -1,6 +1,3 @@
-//! TODO
-//!
-
 use std::ptr;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicPtr;
@@ -107,7 +104,7 @@ impl<T> Atomic<T> {
 
     /// If the atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the atomic pointer is returned.
     ///
     /// Argument `order` describes the memory ordering of this operation.
@@ -123,7 +120,7 @@ impl<T> Atomic<T> {
 
     /// If the atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the atomic pointer is returned.
     ///
     /// This method can sometimes spuriously fail even when comparison succeeds, which can result
@@ -145,7 +142,7 @@ impl<T> Atomic<T> {
 
     /// If the atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On success the
+    /// The return value is a result indicating whether the new pointer was stored. On success the
     /// new pointer is returned. On failure the current value of the atomic pointer and `new` are
     /// returned.
     ///
@@ -162,7 +159,7 @@ impl<T> Atomic<T> {
 
     /// If the atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On success the
+    /// The return value is a result indicating whether the new pointer was stored. On success the
     /// new pointer is returned. On failure the current value of the atomic pointer and `new` are
     /// returned.
     ///
@@ -185,7 +182,7 @@ impl<T> Atomic<T> {
 
     /// If the atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the atomic pointer is returned.
     ///
     /// Argument `order` describes the memory ordering of this operation.
@@ -201,7 +198,7 @@ impl<T> Atomic<T> {
 
     /// If the atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the atomic pointer is returned.
     ///
     /// This method can sometimes spuriously fail even when comparison succeeds, which can result
@@ -219,6 +216,12 @@ impl<T> Atomic<T> {
             Ok(_) => Ok(()),
             Err(previous) => Err(previous),
         }
+    }
+}
+
+impl<T> Default for Atomic<T> {
+    fn default() -> Self {
+        Self::null()
     }
 }
 
@@ -276,5 +279,11 @@ impl<'p, T> Ptr<'p, T> {
     /// Panics if the pointer is null.
     pub fn unwrap(&self) -> &'p T {
         self.as_ref().unwrap()
+    }
+}
+
+impl<'p, T> Default for Ptr<'p, T> {
+    fn default() -> Self {
+        Self::null()
     }
 }

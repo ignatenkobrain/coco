@@ -1,6 +1,3 @@
-//! TODO
-//!
-
 use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
@@ -9,23 +6,28 @@ use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
 
 use Pin;
 
-/// Returns the number of unused least significant bits in a pointer to `T`.
+/// Returns the number of unused least significant bits of a pointer to `T`.
 fn low_bits<T>() -> usize {
     (1 << mem::align_of::<T>().trailing_zeros()) - 1
 }
 
-/// Tags the unused least significant bits in `raw` with `tag`.
+/// Tags the unused least significant bits of `raw` with `tag`.
 ///
 /// # Panics
 ///
-/// Panics if the tag doesn't fit into the unused bits in the pointer.
+/// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+/// unaligned.
 fn raw_and_tag<T>(raw: *mut T, tag: usize) -> usize {
     let mask = low_bits::<T>();
+    assert!(raw as usize & mask == 0, "unaligned pointer");
     assert!(tag <= mask, "tag too large to fit into the unused bits: {} > {}", tag, mask);
     raw as usize | tag
 }
 
 /// A tagged atomic nullable pointer.
+///
+/// The tag is stored into the unused least significant bits of the pointer. The pointer must be
+/// properly aligned.
 #[derive(Debug)]
 pub struct TaggedAtomic<T> {
     data: AtomicUsize,
@@ -45,12 +47,21 @@ impl<T> TaggedAtomic<T> {
     }
 
     /// Returns a new, null atomic pointer tagged with `tag`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of an aligned pointer.
     pub fn null(tag: usize) -> Self {
         unsafe { Self::from_raw(ptr::null_mut(), tag) }
     }
 
     /// Allocates `data` on the heap and returns a new atomic pointer that points to it and is
     /// tagged with `tag`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the allocated
+    /// pointer is unaligned.
     pub fn new(data: T, tag: usize) -> Self {
         unsafe { Self::from_raw(Box::into_raw(Box::new(data)), tag) }
     }
@@ -61,11 +72,21 @@ impl<T> TaggedAtomic<T> {
     }
 
     /// Returns a new atomic pointer initialized with `b` and `tag`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub fn from_box(b: Box<T>, tag: usize) -> Self {
         unsafe { Self::from_raw(Box::into_raw(b), tag) }
     }
 
     /// Returns a new atomic pointer initialized with `raw` and `tag`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub unsafe fn from_raw(raw: *mut T, tag: usize) -> Self {
         Self::from_data(raw_and_tag(raw, tag))
     }
@@ -95,6 +116,11 @@ impl<T> TaggedAtomic<T> {
     /// Stores `new` tagged with `tag` into the atomic and returns it.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub fn store_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, _: &'p Pin)
                          -> TaggedPtr<'p, T> {
         let ptr = unsafe { TaggedPtr::from_raw(Box::into_raw(new), tag) };
@@ -105,6 +131,11 @@ impl<T> TaggedAtomic<T> {
     /// Stores `new` tagged with `tag` into the atomic.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub fn store_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering, _: &'p Pin)
                          -> TaggedPtr<'p, T> {
         let ptr = unsafe { TaggedPtr::from_raw(new, tag) };
@@ -122,6 +153,11 @@ impl<T> TaggedAtomic<T> {
     /// Stores `new` tagged with `tag` into the atomic, returning the old tagged pointer.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub fn swap_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering) -> TaggedPtr<'p, T> {
         let data = unsafe { TaggedPtr::from_raw(Box::into_raw(new), tag).data };
         unsafe { TaggedPtr::from_data(self.data.swap(data, order)) }
@@ -130,6 +166,11 @@ impl<T> TaggedAtomic<T> {
     /// Stores `new` tagged with `tag` into the atomic, returning the old tagged pointer.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub unsafe fn swap_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering)
                                -> TaggedPtr<'p, T> {
         let data = TaggedPtr::from_raw(new, tag).data;
@@ -138,7 +179,7 @@ impl<T> TaggedAtomic<T> {
 
     /// If the tagged atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the tagged atomic pointer is returned.
     ///
     /// Argument `order` describes the memory ordering of this operation.
@@ -154,7 +195,7 @@ impl<T> TaggedAtomic<T> {
 
     /// If the tagged atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the tagged atomic pointer is returned.
     ///
     /// This method can sometimes spuriously fail even when comparison succeeds, which can result
@@ -176,11 +217,16 @@ impl<T> TaggedAtomic<T> {
 
     /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On success the
+    /// The return value is a result indicating whether the new pointer was stored. On success the
     /// new pointer is returned. On failure the current value of the tagged atomic pointer and
     /// `new` are returned.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub fn cas_box<'p>(&self, current: TaggedPtr<'p, T>, mut new: Box<T>, tag: usize,
                        order: Ordering)
                        -> Result<TaggedPtr<'p, T>, (TaggedPtr<'p, T>, Box<T>)> {
@@ -196,7 +242,7 @@ impl<T> TaggedAtomic<T> {
 
     /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On success the
+    /// The return value is a result indicating whether the new pointer was stored. On success the
     /// new pointer is returned. On failure the current value of the tagged atomic pointer and
     /// `new` are returned.
     ///
@@ -204,6 +250,11 @@ impl<T> TaggedAtomic<T> {
     /// in more efficient code on some platforms.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub fn cas_box_weak<'p>(&self, current: TaggedPtr<'p, T>, mut new: Box<T>, tag: usize,
                             order: Ordering)
                             -> Result<TaggedPtr<'p, T>, (TaggedPtr<'p, T>, Box<T>)> {
@@ -224,10 +275,15 @@ impl<T> TaggedAtomic<T> {
 
     /// If the tagged atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the tagged atomic pointer is returned.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub unsafe fn cas_raw(&self, current: (*mut T, usize), new: (*mut T, usize), order: Ordering)
                           -> Result<(), (*mut T, usize)> {
         let current_data = raw_and_tag(current.0, current.1);
@@ -243,13 +299,18 @@ impl<T> TaggedAtomic<T> {
 
     /// If the tagged atomic pointer is equal to `current`, stores `new`.
     ///
-    /// The return value is a result indicating whether the new value was stored. On failure the
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the tagged atomic pointer is returned.
     ///
     /// This method can sometimes spuriously fail even when comparison succeeds, which can result
     /// in more efficient code on some platforms.
     ///
     /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub unsafe fn cas_raw_weak(&self, current: (*mut T, usize), new: (*mut T, usize),
                                order: Ordering)
                                -> Result<(), (*mut T, usize)> {
@@ -262,6 +323,12 @@ impl<T> TaggedAtomic<T> {
             let ptr = TaggedPtr::from_data(previous);
             Err((ptr.as_raw(), ptr.tag()))
         }
+    }
+}
+
+impl<T> Default for TaggedAtomic<T> {
+    fn default() -> Self {
+        Self::null(0)
     }
 }
 
@@ -293,11 +360,20 @@ impl<'p, T: 'p> TaggedPtr<'p, T> {
     }
 
     /// Returns a null pointer with a tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of an aligned pointer.
     pub fn null(tag: usize) -> Self {
         unsafe { Self::from_data(raw_and_tag::<T>(ptr::null_mut(), tag)) }
     }
 
     /// Constructs a tagged pointer from a raw pointer and tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
     pub unsafe fn from_raw(raw: *mut T, tag: usize) -> Self {
         Self::from_data(raw_and_tag(raw, tag))
     }
@@ -332,7 +408,17 @@ impl<'p, T: 'p> TaggedPtr<'p, T> {
     }
 
     /// Constructs a new tagged pointer with a different tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer.
     pub fn with_tag(&self, tag: usize) -> Self {
         unsafe { Self::from_raw(self.as_raw(), tag) }
+    }
+}
+
+impl<'p, T> Default for TaggedPtr<'p, T> {
+    fn default() -> Self {
+        Self::null(0)
     }
 }
