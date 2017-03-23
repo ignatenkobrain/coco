@@ -1,10 +1,10 @@
 [package]
-name = "epoch"
+name = "coco"
 version = "0.1.0"
 authors = ["Stjepan Glavina <stjepang@gmail.com>"]
-description = "Epoch-based memory management"
-repository = "https://github.com/stjepang/epoch"
-documentation = "https://docs.rs/epoch"
+description = "Concurrent collections"
+repository = "https://github.com/stjepang/coco"
+documentation = "https://docs.rs/coco"
 readme = "README.md"
 license = "Apache-2.0/MIT"
 
