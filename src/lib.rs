@@ -6,3 +6,6 @@
 extern crate scopeguard;
 
 pub mod epoch;
+pub mod queue;
+
+pub use queue::Queue;

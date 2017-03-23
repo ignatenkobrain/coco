@@ -10,3 +10,6 @@ license = "Apache-2.0/MIT"
 
 [dependencies]
 scopeguard = "0.3"
+
+[dev-dependencies]
+rand = "0.3"
