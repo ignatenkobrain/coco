@@ -27,6 +27,7 @@
 
 use std::cell::UnsafeCell;
 use std::cmp;
+use std::fmt;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
@@ -35,9 +36,6 @@ use {Atomic, Pin, defer_free};
 
 /// Maximum number of objects a bag can contain.
 const MAX_OBJECTS: usize = 64;
-
-/// Number of bags to destroy when collecting garbage.
-const COLLECT_STEPS: usize = 8;
 
 /// The global epoch.
 ///
@@ -66,7 +64,7 @@ impl Bag {
     pub fn new() -> Self {
         Bag {
             len: AtomicUsize::new(0),
-            objects: unsafe { mem::uninitialized() },
+            objects: unsafe { mem::zeroed() },
             epoch: unsafe { mem::uninitialized() },
             next: Atomic::null(),
         }
@@ -211,6 +209,9 @@ impl Garbage {
     /// already triggers garbage destruction. However, if there are long periods without garbage
     /// production, it might be a good idea to call this method from time to time.
     pub fn collect(&self, pin: &Pin) {
+        /// Number of bags to destroy.
+        const COLLECT_STEPS: usize = 8;
+
         let epoch = EPOCH.load(SeqCst);
         let condition = |bag: &Bag| {
             // A pinned thread can witness at most two epoch advancements. Therefore, any bag that
@@ -316,6 +317,12 @@ impl Drop for Garbage {
                 (*head).destroy_all_objects();
             }
         }
+    }
+}
+
+impl fmt::Debug for Garbage {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Garbage {{ ... }}")
     }
 }
 

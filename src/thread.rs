@@ -23,9 +23,6 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use TaggedAtomic;
 use garbage::{self, Bag, EPOCH};
 
-/// Number of pinnings after which a thread will collect some global garbage.
-const PINS_BEFORE_COLLECT: usize = 128;
-
 thread_local! {
     /// The thread registration harness.
     ///
@@ -270,17 +267,20 @@ pub struct Pin {
 /// deleted objects protected by [`Atomic`]s. The provided function should be very quick -
 /// generally speaking, it shouldn't take more than 100 ms.
 ///
+/// Pinning is reentrant. There is no harm in pinning a thread while it's already pinned (repinning
+/// is essentially a noop).
+///
 /// Pinning itself comes with a price: it begins with a `SeqCst` fence and performs a few other
 /// atomic operations. However, this mechanism is designed to be as performant as possible, so it
 /// can be used pretty liberally. On a modern machine pinning takes 10 to 15 nanoseconds.
-///
-/// Pinning is reentrant. There is no harm in pinning a thread while it's already pinned (repinning
-/// is essentially a noop).
 ///
 /// [`Atomic`]: struct.Atomic.html
 pub fn pin<F, T>(f: F) -> T
     where F: FnOnce(&Pin) -> T
 {
+    /// Number of pinnings after which a thread will collect some global garbage.
+    const PINS_BETWEEN_COLLECT: usize = 128;
+
     HARNESS.with(|harness| {
         let thread = unsafe { &*harness.thread };
         let pin = &Pin { bag: &harness.bag };
@@ -296,7 +296,7 @@ pub fn pin<F, T>(f: F) -> T
             harness.pin_count.set(count.wrapping_add(1));
 
             // If the counter progressed enough, try advancing the epoch and collecting garbage.
-            if count % PINS_BEFORE_COLLECT == 0 {
+            if count % PINS_BETWEEN_COLLECT == 0 {
                 try_advance(pin);
                 garbage::collect(pin);
             }

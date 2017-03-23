@@ -1,12 +1,9 @@
-//! Epoch-based memory reclamation
+//! Epoch-based memory management
 //!
-//! TODO: Explain how EBR is used, with examples (maybe a simple treiber stack, with drop impl that
-//! pins every X steps)
-//!
-//! TODO: A treiber stack that uses AtomicPtr instead of Atomic
-
-// TODO: Debug for atomics, ptrs and pin
-// TODO: swap method on atomics
+//! TODO: Explain how EBR is used, with examples
+//! TODO: Explain pinning
+//! TODO: Explain pointers
+//! TODO: Explain garbage collection
 
 #[macro_use(defer)]
 extern crate scopeguard;
