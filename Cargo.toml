@@ -2,7 +2,7 @@
 name = "epoch"
 version = "0.1.0"
 authors = ["Stjepan Glavina <stjepang@gmail.com>"]
-description = "Epoch-based memory reclamation"
+description = "Epoch-based memory management"
 repository = "https://github.com/stjepang/epoch"
 documentation = "https://docs.rs/epoch"
 readme = "README.md"
