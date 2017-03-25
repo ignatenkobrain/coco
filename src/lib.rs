@@ -2,6 +2,8 @@
 //!
 //! TODO: Explain
 
+extern crate either;
+
 #[macro_use(defer)]
 extern crate scopeguard;
 
