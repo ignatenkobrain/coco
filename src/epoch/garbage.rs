@@ -294,7 +294,7 @@ impl Drop for Garbage {
             let pending = self.pending.load_raw(Relaxed);
             if !pending.is_null() {
                 (*pending).destroy_all_objects();
-                drop(Box::from_raw(pending));
+                drop(Vec::from_raw_parts(pending));
             }
 
             // Destroy all bags and objects in the queue.
@@ -302,7 +302,7 @@ impl Drop for Garbage {
             loop {
                 // Load the next bag and destroy the current head.
                 let next = (*head).next.load_raw(Relaxed);
-                drop(Box::from_raw(head));
+                drop(Vec::from_raw_parts(head, 0, 1));
 
                 // If the next node is null, we've reached the end of the queue.
                 if next.is_null() {
