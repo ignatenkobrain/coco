@@ -294,7 +294,7 @@ impl Drop for Garbage {
             let pending = self.pending.load_raw(Relaxed);
             if !pending.is_null() {
                 (*pending).destroy_all_objects();
-                drop(Vec::from_raw_parts(pending));
+                drop(Vec::from_raw_parts(pending, 0, 1));
             }
 
             // Destroy all bags and objects in the queue.

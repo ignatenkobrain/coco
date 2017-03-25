@@ -302,7 +302,7 @@ impl<T> Drop for Queue<T> {
         loop {
             // Load the next node and destroy the current one.
             let next = unsafe { (*head).next.load_raw(Relaxed) };
-            unsafe { drop(Box::from_raw_parts(head, 0, 1)) }
+            unsafe { drop(Vec::from_raw_parts(head, 0, 1)) }
 
             // If the next node is null, we've reached the end of the queue.
             if next.is_null() {
