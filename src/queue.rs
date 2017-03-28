@@ -8,17 +8,42 @@ use std::time::{Duration, Instant};
 
 use either::Either;
 
-use epoch::{self, Atomic, Pin, Ptr};
+use epoch::{self, TaggedAtomic, Pin, TaggedPtr};
 
+/// Payload every node is carrying.
 enum Payload<T> {
-    Data(T),
+    /// Pushed value.
+    Value(T),
+    /// Request for a value - a waiting pop operation.
     Request(*mut Request<T>),
 }
 
+impl<T> Payload<T> {
+    /// Returns `true` if the payload is a value.
+    fn is_value(&self) -> bool {
+        match *self {
+            Payload::Value(_) => true,
+            Payload::Request(_) => false,
+        }
+    }
+
+    /// Returns `true` if the payload is a request.
+    fn is_request(&self) -> bool {
+        match *self {
+            Payload::Value(_) => false,
+            Payload::Request(_) => true,
+        }
+    }
+}
+
+/// Request for a value by a blocking pop operation.
 struct Request<T> {
+    /// The thread that requests a value.
     thread: Thread,
+    /// A push operation sets this to `true` after it passes a value over.
     ready: AtomicBool,
-    data: Option<T>,
+    /// The slot through which a value will be passed over.
+    value: Option<T>,
 }
 
 /// A single node in a queue.
@@ -26,17 +51,35 @@ struct Node<T> {
     /// The payload.
     payload: Payload<T>,
     /// The next node in the queue.
-    next: Atomic<Node<T>>,
+    next: TaggedAtomic<Node<T>>,
 }
 
 /// The inner representation of a queue.
 ///
 /// It consists of a head and tail pointer, with some padding in-between to avoid false sharing.
+/// A queue is a singly linked list of value nodes. There is always one sentinel value node, and
+/// that is the head. If both head and tail point to the sentinel node, the queue is empty.
+///
+/// If the queue is empty, there might be a list of request nodes following the tail, which
+/// represent threads blocked on future push operations. The tail never moves onto a request node.
+///
+/// To summarize, the structure of the queue is always one of these two:
+///
+/// 1. Sentinel node (head), followed by a number of value nodes (the last one is tail).
+/// 2. Sentinel node (head and tail), followed by a number of request nodes.
+///
+/// Requests are fulfilled by marking the next-pointer of it's node, then copying a value into the
+/// slot, and finally signalling that the blocked thread is ready to be woken up. Nodes with marked
+/// next-pointers are considered to be deleted and can always be unlinked from the list. A request
+/// can cancel itself simply by marking the next-pointer of it's node.
 #[repr(C)]
 struct Inner<T> {
-    head: Atomic<Node<T>>,
+    /// Head of the queue.
+    head: TaggedAtomic<Node<T>>,
+    /// Some padding to avoid false sharing.
     _pad: [u8; 64],
-    tail: Atomic<Node<T>>,
+    /// Tail ofthe queue.
+    tail: TaggedAtomic<Node<T>>,
 }
 
 /// A lock-free multi-producer multi-consumer queue.
@@ -48,13 +91,17 @@ unsafe impl<T: Send> Sync for Queue<T> {}
 impl<T> Queue<T> {
     /// Returns a new, empty queue.
     pub fn new() -> Queue<T> {
+        // Create a sentinel node.
+        let node = Box::new(Node {
+            payload: Payload::Value(unsafe { mem::uninitialized() }),
+            next: TaggedAtomic::null(0),
+        });
+
+        // Initialize the internal representation of the queue.
         let inner = Inner {
-            head: Atomic::from_box(Box::new(Node {
-                payload: unsafe { mem::uninitialized() },
-                next: Atomic::null(),
-            })),
+            head: TaggedAtomic::from_box(node, 0),
             _pad: unsafe { mem::uninitialized() },
-            tail: Atomic::null(),
+            tail: TaggedAtomic::null(0),
         };
 
         // Copy the head pointer into the tail pointer.
@@ -71,104 +118,119 @@ impl<T> Queue<T> {
             let head = inner.head.load(Acquire, pin);
             let next = head.unwrap().next.load(Acquire, pin);
 
+            // Check whether there is a value node following the head.
             match next.as_ref() {
-                None => true,
-                Some(n) => {
-                    match n.payload {
-                        Payload::Data(_) => false,
-                        Payload::Request(_) => true,
-                    }
-                }
+                None => return true,
+                Some(n) => return n.payload.is_request(),
             }
         })
     }
 
-    fn push_weak<'p>(&self, tail: Ptr<'p, Node<T>>, new: Box<Node<T>>, pin: &'p Pin)
-                     -> Result<(), (Ptr<'p, Node<T>>, Box<Node<T>>)>
-    {
+    /// Pushes a new value into the queue.
+    pub fn push(&self, value: T) {
         let inner = &self.0;
-        let next = tail.unwrap().next.load(Acquire, pin);
-
-        if next.is_null() {
-            match tail.unwrap().next.cas_box_weak(next, new, AcqRel) {
-                Ok(new) => {
-                    // Tail pointer shouldn't fall behind. Let's move it forward.
-                    let _ = inner.tail.cas(tail, new, Release);
-                    Ok(())
-                }
-                Err((t, n)) => Err((t, n)),
-            }
-        } else {
-            // This is not the actual tail. Move the tail pointer forward.
-            match inner.tail.cas_weak(tail, next, AcqRel) {
-                Ok(()) => Err((next, new)),
-                Err(t) => Err((t, new)),
-            }
-        }
-    }
-
-    /// Pushes a new element into the queue.
-    pub fn push(&self, data: T) {
-        let inner = &self.0;
-        let mut data = Either::Left(data);
+        let mut value = Either::Left(value);
 
         epoch::pin(|pin| {
+            let mut steps = 0usize;
             let mut tail = inner.tail.load(Acquire, pin);
+
             loop {
-                // Does the queue contain a request node?
-                let has_request = match tail.unwrap().payload {
-                    Payload::Data(_) => false,
-                    Payload::Request(_) => inner.head.load(Relaxed, pin).as_raw() != tail.as_raw(),
-                };
+                steps = steps.wrapping_add(1);
 
-                if has_request {
-                    // The request node should be the one following the head.
-                    let head = inner.head.load(Acquire, pin);
-                    let next = head.unwrap().next.load(Acquire, pin);
+                // Load the node following the tail.
+                let t = tail.unwrap();
+                let next = t.next.load(Acquire, pin);
 
-                    match next.unwrap().payload {
-                        Payload::Data(_) => {}
-                        Payload::Request(req) => {
-                            // Try moving the head forward.
-                            if inner.head.cas_weak(head, next, Release).is_ok() {
-                                unsafe {
-                                    // The old head may be later freed.
-                                    epoch::defer_free(head.as_raw(), pin);
+                match next.as_ref() {
+                    None => {
+                        // There is no request node. Do a normal push.
+                        let new = match value {
+                            Either::Left(v) => Box::new(Node {
+                                payload: Payload::Value(v),
+                                next: TaggedAtomic::null(0),
+                            }),
+                            Either::Right(new) => new,
+                        };
 
-                                    let data = data.either(|l| l, |r: Box<Node<T>>| {
-                                        match r.payload {
-                                            Payload::Data(d) => d,
-                                            Payload::Request(_) => unreachable!(),
-                                        }
-                                    });
-
-                                    // Fulfill the request.
-                                    (*req).data = Some(data);
-                                    (*req).ready.store(true, Release);
-                                    (*req).thread.unpark();
-                                    break;
+                        // Try installing the new node.
+                        match t.next.cas_box_weak(next, new, 0, AcqRel) {
+                            Ok(new) => {
+                                // Successfully pushed the node!
+                                // Tail pointer mustn't fall behind. Move it forward.
+                                let _ = inner.tail.cas(tail, new, Release);
+                                break;
+                            }
+                            Err((next, v)) => {
+                                // Failed. The node that acutally follows `t` is `next`.
+                                match next.as_ref() {
+                                    // If this is a value node and we didn't already retry too many
+                                    // times, it is probably the current tail.
+                                    Some(n) if n.payload.is_value() && steps < 5 => tail = next,
+                                    // Otherwise, load a fresh tail.
+                                    _ => tail = inner.tail.load(Acquire, pin),
                                 }
+                                value = Either::Right(v);
                             }
                         }
                     }
+                    Some(n) => {
+                        match n.payload {
+                            Payload::Value(_) => {
+                                // Tail pointer fell behind. Move it forward.
+                                match inner.tail.cas_weak(tail, next, AcqRel) {
+                                    Ok(()) => tail = next,
+                                    Err(t) => tail = t,
+                                }
+                            }
+                            Payload::Request(req) => {
+                                // Try fulfilling this request.
+                                let succ = n.next.load(Acquire, pin);
 
-                    // We failed to fulfill a request. Load the current tail and try again.
-                    tail = inner.tail.load(Acquire, pin);
-                } else {
-                    // There is no request node. Try pushing a data node.
-                    let new = match data {
-                        Either::Left(d) => Box::new(Node {
-                            payload: Payload::Data(d),
-                            next: Atomic::null(),
-                        }),
-                        Either::Right(new) => new,
-                    };
+                                if succ.tag() == 0 {
+                                    // Try marking the node as deleted.
+                                    if n.next.cas_weak(succ, succ.with_tag(1), Release).is_ok() {
+                                        // Prepare the value.
+                                        let value = value.either(|l| l, |r: Box<Node<T>>| {
+                                            match r.payload {
+                                                Payload::Value(v) => v,
+                                                Payload::Request(_) => unreachable!(),
+                                            }
+                                        });
 
-                    match self.push_weak(tail, new, pin) {
-                        Ok(()) => break,
-                        Err((t, n)) => {
-                            tail = t;
-                            data = Either::Right(n);
+                                        unsafe {
+                                            let thread = (*req).thread.clone();
+
+                                            // Pass `value` over and wake up the waiting thread.
+                                            (*req).value = Some(value);
+                                            (*req).ready.store(true, Release);
+
+                                            // Because we stored `true`, the thread is ready to
+                                            // pick up the value. Before we unpark it, the thread
+                                            // might even wake up by itself, pick up the value, and
+                                            // destruct `req` from it's own stack. It's very
+                                            // important that we don't touch `req` from now on.
+                                            thread.unpark();
+
+                                            // Finally, try unlinking the node.
+                                            if t.next.cas_weak(next, succ, Release).is_ok() {
+                                                epoch::defer_free(next.as_raw(), pin);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    // This request node is deleted. Try unlinking it.
+                                    let succ = succ.with_tag(0);
+                                    if t.next.cas_weak(next, succ, Release).is_ok() {
+                                        unsafe { epoch::defer_free(next.as_raw(), pin) }
+                                    }
+                                }
+
+                                // We didn't make any progress.
+                                // Reload the tail pointer and try again.
+                                tail = inner.tail.load(Acquire, pin);
+                            }
                         }
                     }
                 }
@@ -176,35 +238,7 @@ impl<T> Queue<T> {
         })
     }
 
-    fn pop_weak<'p>(&self, head: Ptr<'p, Node<T>>, pin: &'p Pin)
-                    -> Result<Option<T>, Ptr<'p, Node<T>>>
-    {
-        let inner = &self.0;
-        let next = head.unwrap().next.load(Acquire, pin);
-
-        match next.as_ref() {
-            None => return Ok(None),
-            Some(n) => {
-                match n.payload {
-                    Payload::Data(ref data) => {
-                        // Try unlinking the head by moving it forward.
-                        match inner.head.cas_weak(head, next, AcqRel) {
-                            Ok(_) => unsafe {
-                                // The old head may be later freed.
-                                epoch::defer_free(head.as_raw(), pin);
-                                // The new head holds the popped value.
-                                return Ok(Some(ptr::read(data)));
-                            },
-                            Err(h) => return Err(h),
-                        }
-                    }
-                    Payload::Request(_) => return Err(inner.head.load(Acquire, pin)),
-                }
-            }
-        }
-    }
-
-    /// Attempts to pop an element from the queue.
+    /// Attempts to pop a value from the queue.
     ///
     /// Returns `None` if the queue is empty.
     pub fn try_pop(&self) -> Option<T> {
@@ -213,96 +247,230 @@ impl<T> Queue<T> {
         epoch::pin(|pin| {
             let mut head = inner.head.load(Acquire, pin);
             loop {
-                match self.pop_weak(head, pin) {
-                    Ok(r) => return r,
-                    Err(h) => head = h,
+                let next = head.unwrap().next.load(Acquire, pin);
+                match next.as_ref() {
+                    None => return None,
+                    Some(n) => {
+                        match n.payload {
+                            Payload::Value(ref value) => {
+                                // Try unlinking the head by moving it forward.
+                                match inner.head.cas_weak(head, next, AcqRel) {
+                                    Ok(_) => unsafe {
+                                        // The old head may be later freed.
+                                        epoch::defer_free(head.as_raw(), pin);
+                                        // The new head holds the popped value.
+                                        return Some(ptr::read(value));
+                                    },
+                                    Err(h) => head = h,
+                                }
+                            }
+                            Payload::Request(_) => return None,
+                        }
+                    }
                 }
             }
         })
     }
 
-    fn pop_until(&self, deadline: Option<Instant>) -> Option<T> {
+    /// Attempts to cancel a request by finding and deleting it's node.
+    ///
+    /// Returns `true` if this method deleted the node, and `false` if it was already deleted.
+    fn cancel_request(&self, req: *mut Request<T>, pin: &Pin) -> bool {
         let inner = &self.0;
 
-        let mut req = Request {
-            thread: thread::current(),
-            ready: AtomicBool::new(false),
-            data: None,
-        };
-        let req = &mut req;
+        'retry: loop {
+            let head = inner.head.load(Acquire, pin);
+            let mut pred = &head.unwrap().next;
+            let mut curr = pred.load(Acquire, pin);
 
-        epoch::pin(|pin| {
-            let mut new = Box::new(Node {
-                payload: Payload::Request(req),
-                next: Atomic::null(),
-            });
-
-            let mut tail = inner.tail.load(Acquire, pin);
-            loop {
-                let head = inner.head.load(Acquire, pin);
-                if let Ok(Some(r)) = self.pop_weak(head, pin) {
-                    return Some(r);
+            // If there are no request nodes, there is nothing to cancel.
+            if let Some(c) = curr.as_ref() {
+                if c.payload.is_value() {
+                    return false;
                 }
+            }
 
-                match tail.unwrap().payload {
-                    Payload::Data(_) if head.as_raw() != tail.as_raw() => {
-                        tail = inner.tail.load(Acquire, pin);
-                    },
-                    _ => {
-                        match self.push_weak(tail, new, pin) {
-                            Ok(()) => return None,
-                            Err((t, n)) => {
-                                tail = t;
-                                new = n;
+            // Find the request node that contains `req`.
+            while let Some(c) = curr.as_ref() {
+                let succ = c.next.load(Acquire, pin);
+
+                if succ.tag() == 1 {
+                    // This request node is deleted. Try unlinking it.
+                    let succ = succ.with_tag(0);
+                    match pred.cas_weak(curr, succ, Release) {
+                        Ok(_) => unsafe { epoch::defer_free(curr.as_raw(), pin) },
+                        Err(_) => continue 'retry,
+                    }
+
+                    // Update the current node.
+                    curr = succ;
+                } else {
+                    // If this is the request that needs to be cancelled...
+                    if let Payload::Request(r) = c.payload {
+                        if r == req {
+                            // Try marking the node as deleted.
+                            match c.next.cas_weak(succ, succ.with_tag(1), Release) {
+                                Ok(_) => return true,
+                                Err(_) => continue 'retry,
                             }
                         }
                     }
+
+                    // Move one node forward.
+                    pred = &c.next;
+                    curr = succ;
+                }
+            }
+
+            // Reached the end of the list.
+            return false;
+        }
+    }
+
+    /// Attempts to pop a value until the specified deadline.
+    ///
+    /// This method blocks the current thread until a value is available, or the deadline is
+    /// exceeded.
+    fn pop_until(&self, deadline: Option<Instant>) -> Option<T> {
+        let inner = &self.0;
+
+        // Try immediately popping a value.
+        if let Some(r) = self.try_pop() {
+            return Some(r);
+        }
+
+        // Allocate a request on the stack.
+        let mut req = Request {
+            thread: thread::current(),
+            ready: AtomicBool::new(false),
+            value: None,
+        };
+        let req = &mut req;
+
+        // Since the queue is empty, attempt to install a new request node.
+        epoch::pin(|pin| {
+            let mut new = Box::new(Node {
+                payload: Payload::Request(req),
+                next: TaggedAtomic::null(0),
+            });
+
+            'retry: loop {
+                let head = inner.head.load(Acquire, pin);
+                let mut pred = &head.unwrap().next;
+                let mut curr = pred.load(Acquire, pin);
+
+                // If there is a value node, try popping a value.
+                if let Some(c) = curr.as_ref() {
+                    match c.payload {
+                        Payload::Value(ref value) => {
+                            // Try unlinking the head by moving it forward.
+                            match inner.head.cas_weak(head, curr, AcqRel) {
+                                Ok(_) => unsafe {
+                                    // The old head may be later freed.
+                                    epoch::defer_free(head.as_raw(), pin);
+                                    // The new head holds the popped value.
+                                    return Some(ptr::read(value));
+                                },
+                                Err(_) => continue 'retry,
+                            }
+                        }
+                        Payload::Request(_) => {}
+                    }
+                }
+
+                // Find the end of the list.
+                while let Some(c) = curr.as_ref() {
+                    let succ = c.next.load(Acquire, pin);
+
+                    if succ.tag() == 1 {
+                        // This request node is deleted. Try unlinking it.
+                        let succ = succ.with_tag(0);
+                        match pred.cas_weak(curr, succ, Release) {
+                            Ok(_) => unsafe { epoch::defer_free(curr.as_raw(), pin) },
+                            Err(_) => continue 'retry,
+                        }
+
+                        // Update the current node.
+                        curr = succ;
+                    } else {
+                        // Move one node forward.
+                        pred = &c.next;
+                        curr = succ;
+                    }
+                }
+
+                // Try installing the new request node.
+                match pred.cas_box(TaggedPtr::null(0), new, 0, Release) {
+                    Ok(_) => return None,
+                    Err((_, n)) => new = n,
                 }
             }
         }).or_else(|| {
+            // Wait until the request is fulfilled or the deadline is exceeded.
             while !req.ready.load(Acquire) {
                 match deadline {
                     None => thread::park(),
                     Some(deadline) => {
+                        // Have we reached the deadline?
                         let now = Instant::now();
+
                         if now >= deadline {
-                            return None;
+                            // Yeah. Try cancelling the request.
+                            if epoch::pin(|pin| self.cancel_request(req, pin)) {
+                                // Successfully cancelled.
+                                return None;
+                            } else {
+                                // A thread is about to fulfill the request in a moment - it just
+                                // has to copy it's value into the slot.
+                                thread::park();
+                            }
+                        } else {
+                            // Wait until the deadline.
+                            thread::park_timeout(deadline - now);
                         }
-                        thread::park_timeout(deadline - now);
                     }
                 }
             }
-            Some(req.data.take().unwrap())
+
+            // The request has been fulfilled.
+            // Return the popped value.
+            Some(req.value.take().unwrap())
         })
     }
 
+    /// Pops a value from the queue, potentially blocking the current thread.
     pub fn pop(&self) -> T {
-        self.try_pop().or_else(|| self.pop_until(None)).unwrap()
+        self.pop_until(None).unwrap()
     }
 
+    /// Attempts to pop a value from the queue, potentially blocking the current thread.
+    ///
+    /// If the thread waits for more than `timeout`, `None` is returned.
     pub fn pop_timeout(&self, timeout: Duration) -> Option<T> {
-        let inner = &self.0;
-
-        epoch::pin(|pin| {
-            let head = inner.head.load(Acquire, pin);
-            self.pop_weak(head, pin).unwrap_or(None)
-        }).or_else(|| {
-            let deadline = Instant::now() + timeout;
-            self.pop_until(Some(deadline))
-        })
+        self.pop_until(Some(Instant::now() + timeout))
     }
 }
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
         let inner = &self.0;
+        let head = inner.head.load_raw(Relaxed).0;
 
         // Destruct all nodes in the queue.
-        let mut head = inner.head.load_raw(Relaxed);
+        let mut curr = head;
         loop {
             // Load the next node and destroy the current one.
-            let next = unsafe { (*head).next.load_raw(Relaxed) };
-            unsafe { drop(Vec::from_raw_parts(head, 0, 1)) }
+            let next = unsafe { (*curr).next.load_raw(Relaxed).0 };
+
+            unsafe {
+                if curr == head || (*curr).payload.is_request() {
+                    // The sentinel node and request nodes must be freed.
+                    drop(Vec::from_raw_parts(curr, 0, 1));
+                } else {
+                    // Other nodes are destructed.
+                    drop(Box::from_raw(curr));
+                }
+            }
 
             // If the next node is null, we've reached the end of the queue.
             if next.is_null() {
@@ -310,7 +478,7 @@ impl<T> Drop for Queue<T> {
             }
 
             // Move one step forward.
-            head = next;
+            curr = next;
         }
     }
 }
