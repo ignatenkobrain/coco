@@ -241,7 +241,7 @@ impl<T> Queue<T> {
     /// Attempts to pop a value from the queue.
     ///
     /// Returns `None` if the queue is empty.
-    pub fn try_pop(&self) -> Option<T> {
+    pub fn pop(&self) -> Option<T> {
         let inner = &self.0;
 
         epoch::pin(|pin| {
@@ -335,7 +335,7 @@ impl<T> Queue<T> {
         let inner = &self.0;
 
         // Try immediately popping a value.
-        if let Some(r) = self.try_pop() {
+        if let Some(r) = self.pop() {
             return Some(r);
         }
 
@@ -439,7 +439,7 @@ impl<T> Queue<T> {
     }
 
     /// Pops a value from the queue, potentially blocking the current thread.
-    pub fn pop(&self) -> T {
+    pub fn pop_wait(&self) -> T {
         self.pop_until(None).unwrap()
     }
 
@@ -505,9 +505,9 @@ mod tests {
         let s = Queue::new();
         s.push(10);
         s.push(20);
-        assert_eq!(s.try_pop(), Some(10));
-        assert_eq!(s.try_pop(), Some(20));
-        assert_eq!(s.try_pop(), None);
+        assert_eq!(s.pop(), Some(10));
+        assert_eq!(s.pop(), Some(20));
+        assert_eq!(s.pop(), None);
     }
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
                         let x = rng.gen::<i32>();
                         s.push(x);
                     } else {
-                        s.try_pop();
+                        s.pop();
                     }
                 }
             }));

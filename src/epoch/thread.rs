@@ -317,7 +317,8 @@ pub fn pin<F, T>(f: F) -> T
 
 /// Stashes away an object that will later be freed.
 ///
-/// This function simply inserts the object into a globally shared [`Garbage`] instance.
+/// This function inserts the object into a thread-local buffer. When the buffers becomes full,
+/// it's objects are flushed into a globally shared [`Garbage`] instance.
 ///
 /// [`Garbage`]: struct.Garbage.html
 pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {

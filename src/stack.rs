@@ -6,7 +6,7 @@ use epoch::{self, Atomic};
 /// A single node in a stack.
 struct Node<T> {
     /// The payload.
-    data: T,
+    value: T,
     /// The next node in the stack.
     next: Atomic<Node<T>>,
 }
@@ -32,10 +32,10 @@ impl<T> Stack<T> {
         epoch::pin(|pin| self.head.load(Relaxed, pin).is_null())
     }
 
-    /// Pushes a new element onto the stack.
-    pub fn push(&self, data: T) {
+    /// Pushes a new value onto the stack.
+    pub fn push(&self, value: T) {
         let mut node = Box::new(Node {
-            data: data,
+            value: value,
             next: Atomic::null(),
         });
 
@@ -54,10 +54,10 @@ impl<T> Stack<T> {
         })
     }
 
-    /// Attemps to pop an element from the stack.
+    /// Attemps to pop an value from the stack.
     ///
     /// Returns `None` if the stack is empty.
-    pub fn try_pop(&self) -> Option<T> {
+    pub fn pop(&self) -> Option<T> {
         epoch::pin(|pin| {
             let mut head = self.head.load(Acquire, pin);
             loop {
@@ -67,7 +67,7 @@ impl<T> Stack<T> {
                         match self.head.cas_weak(head, next, AcqRel) {
                             Ok(_) => unsafe {
                                 epoch::defer_free(head.as_raw(), pin);
-                                return Some(ptr::read(&h.data));
+                                return Some(ptr::read(&h.value));
                             },
                             Err(h) => head = h,
                         }
