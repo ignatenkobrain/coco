@@ -1,4 +1,4 @@
-//! Thread synchronization and pinning
+//! Thread synchronization and pinning.
 //!
 //! # Registration
 //!

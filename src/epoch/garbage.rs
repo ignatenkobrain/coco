@@ -1,4 +1,4 @@
-//! Garbage collection
+//! Garbage collection.
 //!
 //! # Bags and garbage queues
 //!
