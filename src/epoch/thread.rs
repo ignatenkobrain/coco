@@ -315,6 +315,12 @@ pub fn pin<F, T>(f: F) -> T
     })
 }
 
+/// Returns `true` if the current thread is pinned.
+#[inline]
+pub fn is_pinned() -> bool {
+    HARNESS.with(|harness| harness.is_pinned.get())
+}
+
 /// Stashes away an object that will later be freed.
 ///
 /// This function inserts the object into a thread-local buffer. When the buffers becomes full,
