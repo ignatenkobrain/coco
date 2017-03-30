@@ -1,3 +1,4 @@
+use std::cmp;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -20,6 +21,8 @@ use epoch::Atomic;
 // CDSChecker: Checking Concurrent Data Structures Written with C/C++ Atomics
 // http://plrg.eecs.uci.edu/publications/c11modelcheck.pdf
 // https://github.com/computersforpeace/model-checker-benchmarks/tree/master/chase-lev-deque-bugfix
+
+// TODO: Add {Worker,Stealer}::len() (and watch out for underflow!)
 
 const MIN_LENGTH: usize = 16;
 
@@ -50,16 +53,6 @@ impl<T> Array<T> {
     unsafe fn read(&self, index: isize) -> T {
         ptr::read(self.at(index))
     }
-
-    unsafe fn resize(&self, b: isize, t: isize, new_len: usize) -> Array<T> {
-        let new = Array::new(new_len);
-        let mut i = t;
-        while i != b {
-            ptr::copy_nonoverlapping(self.at(i), new.at(i), 1);
-            i = i.wrapping_add(1);
-        }
-        new
-    }
 }
 
 struct Deque<T> {
@@ -77,12 +70,24 @@ impl<T> Deque<T> {
         }
     }
 
+    fn len(&self) -> usize {
+        let b = self.bottom.load(Relaxed);
+        let t = self.top.load(Relaxed);
+        cmp::max(b.wrapping_sub(t), 0) as usize
+    }
+
     #[cold]
-    unsafe fn replace(&self, old: *mut Array<T>, new: Array<T>) -> *mut Array<T> {
-        let new = Box::into_raw(Box::new(new));
-        self.array.store_raw(new, Release);
-        epoch::pin(|pin| epoch::defer_free(old, pin));
-        new
+    unsafe fn resize(&self, old: *mut Array<T>, b: isize, t: isize, len: usize) -> *mut Array<T> {
+        let new = Array::new(len);
+        let mut i = t;
+        while i != b {
+            ptr::copy_nonoverlapping((*old).at(i), new.at(i), 1);
+            i = i.wrapping_add(1);
+        }
+        epoch::pin(|pin| {
+            epoch::defer_free(old, pin);
+            self.array.store_box(Box::new(new), Release, pin).as_raw()
+        })
     }
 
     fn push(&self, value: T) {
@@ -91,9 +96,11 @@ impl<T> Deque<T> {
             let t = self.top.load(Acquire);
             let mut a = self.array.load_raw(Relaxed);
 
-            let size = b.wrapping_sub(t);
-            if size == (*a).len as isize {
-                a = self.replace(a, (*a).resize(b, t, (*a).len * 2));
+            let width = b.wrapping_sub(t);
+            let len = (*a).len;
+
+            if width == len as isize {
+                a = self.resize(a, b, t, 2 * len);
                 b = self.bottom.load(Relaxed);
             }
 
@@ -106,33 +113,38 @@ impl<T> Deque<T> {
     fn pop(&self) -> Option<T> {
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        if b.wrapping_sub(t) <= 0 {
+        let width = b.wrapping_sub(t);
+
+        if width <= 0 {
             return None;
         }
 
         let b = b.wrapping_sub(1);
         self.bottom.store(b, Relaxed);
         let a = self.array.load_raw(Relaxed);
+
         fence(SeqCst);
+
         let t = self.top.load(Relaxed);
+        let width = b.wrapping_sub(t);
 
-        let size = b.wrapping_sub(t);
+        if width >= 0 {
+            let mut value = unsafe { Some((*a).read(b)) };
 
-        if size >= 0 {
-            unsafe {
-                let mut value = Some((*a).read(b));
-                if t == b {
-                    if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) != t {
-                        mem::forget(value.take());
-                    }
-                    self.bottom.store(b.wrapping_add(1), Relaxed);
-                } else {
-                    if (*a).len > MIN_LENGTH && size < (*a).len as isize / 4 {
-                        self.replace(a, (*a).resize(b, t, (*a).len / 2));
+            if t == b {
+                if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) != t {
+                    mem::forget(value.take());
+                }
+                self.bottom.store(b.wrapping_add(1), Relaxed);
+            } else {
+                unsafe {
+                    let len = (*a).len;
+                    if len > MIN_LENGTH && width < len as isize / 4 {
+                        self.resize(a, b, t, len / 2);
                     }
                 }
-                value
             }
+            value
         } else {
             self.bottom.store(b.wrapping_add(1), Relaxed);
             None
@@ -140,25 +152,28 @@ impl<T> Deque<T> {
     }
 
     fn steal(&self) -> Option<T> {
+        let mut t = self.top.load(Acquire);
+        if epoch::is_pinned() {
+            fence(SeqCst);
+        }
+
         epoch::pin(|pin| {
             loop {
-                let t = self.top.load(Acquire);
-                fence(SeqCst);
                 let b = self.bottom.load(Acquire);
-
                 if b.wrapping_sub(t) <= 0 {
                     return None;
                 }
 
-                unsafe {
-                    let a = self.array.load(Acquire, pin).unwrap();
-                    let value = a.read(t);
+                let a = self.array.load(Acquire, pin).unwrap();
+                let value = unsafe { a.read(t) };
 
-                    if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) == t {
-                        return Some(value);
-                    }
-                    mem::forget(value);
+                if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) == t {
+                    return Some(value);
                 }
+                mem::forget(value);
+
+                t = self.top.load(Acquire);
+                fence(SeqCst);
             }
         })
     }
@@ -189,6 +204,10 @@ pub struct Worker<T> {
 unsafe impl<T: Send> Send for Worker<T> {}
 
 impl<T> Worker<T> {
+    pub fn len(&self) -> usize {
+        self.deque.len()
+    }
+
     pub fn push(&self, value: T) {
         self.deque.push(value);
     }
@@ -213,6 +232,10 @@ unsafe impl<T: Send> Send for Stealer<T> {}
 unsafe impl<T: Send> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
+    pub fn len(&self) -> usize {
+        self.deque.len()
+    }
+
     pub fn steal(&self) -> Option<T> {
         self.deque.steal()
     }
@@ -264,11 +287,17 @@ mod tests {
         let (w, s) = deque();
         assert_eq!(w.pop(), None);
         assert_eq!(s.steal(), None);
+        assert_eq!(w.len(), 0);
+        assert_eq!(s.len(), 0);
 
         w.push(1);
+        assert_eq!(w.len(), 1);
+        assert_eq!(s.len(), 1);
         assert_eq!(w.pop(), Some(1));
         assert_eq!(w.pop(), None);
         assert_eq!(s.steal(), None);
+        assert_eq!(w.len(), 0);
+        assert_eq!(s.len(), 0);
 
         w.push(2);
         assert_eq!(s.steal(), Some(2));
@@ -481,6 +510,8 @@ mod tests {
 
         let rem = remaining.load(SeqCst);
         assert!(rem > 0);
+        assert_eq!(w.len(), rem);
+        assert_eq!(s.len(), rem);
 
         {
             let mut v = dropped.lock().unwrap();

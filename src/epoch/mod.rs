@@ -12,7 +12,7 @@ mod tagged_atomic;
 
 pub use self::atomic::{Atomic, Ptr};
 pub use self::garbage::Garbage;
-pub use self::thread::{Pin, pin, defer_free};
+pub use self::thread::{Pin, is_pinned, pin, defer_free};
 pub use self::tagged_atomic::{TaggedAtomic, TaggedPtr};
 
 // TODO: unit tests
