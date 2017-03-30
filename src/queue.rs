@@ -335,8 +335,8 @@ impl<T> Queue<T> {
         let inner = &self.0;
 
         // Try immediately popping a value.
-        if let Some(r) = self.pop() {
-            return Some(r);
+        if let Some(v) = self.pop() {
+            return Some(v);
         }
 
         // Allocate a request on the stack.
