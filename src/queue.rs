@@ -1,3 +1,5 @@
+//! TODO
+
 use std::fmt;
 use std::mem;
 use std::ptr;
@@ -126,7 +128,7 @@ impl<T> Queue<T> {
         })
     }
 
-    /// Pushes a new value into the queue.
+    /// Pushes an element into the queue.
     pub fn push(&self, value: T) {
         let inner = &self.0;
         let mut value = Either::Left(value);
@@ -238,7 +240,7 @@ impl<T> Queue<T> {
         })
     }
 
-    /// Attempts to pop a value from the queue.
+    /// Attempts to pop an element from the queue.
     ///
     /// Returns `None` if the queue is empty.
     pub fn pop(&self) -> Option<T> {
@@ -327,14 +329,14 @@ impl<T> Queue<T> {
         }
     }
 
-    /// Attempts to pop a value until the specified deadline.
+    /// Attempts to pop an element until the specified deadline.
     ///
-    /// This method blocks the current thread until a value is available, or the deadline is
+    /// This method blocks the current thread until an element is available, or the deadline is
     /// exceeded.
     fn pop_until(&self, deadline: Option<Instant>) -> Option<T> {
         let inner = &self.0;
 
-        // Try immediately popping a value.
+        // Try immediately popping an element.
         if let Some(v) = self.pop() {
             return Some(v);
         }
@@ -359,7 +361,7 @@ impl<T> Queue<T> {
                 let mut pred = &head.unwrap().next;
                 let mut curr = pred.load(Acquire, pin);
 
-                // If there is a value node, try popping a value.
+                // If there is a value node, try popping it.
                 if let Some(c) = curr.as_ref() {
                     match c.payload {
                         Payload::Value(ref value) => {
@@ -438,12 +440,12 @@ impl<T> Queue<T> {
         })
     }
 
-    /// Pops a value from the queue, potentially blocking the current thread.
+    /// Pops an element from the queue, potentially blocking the current thread.
     pub fn pop_wait(&self) -> T {
         self.pop_until(None).unwrap()
     }
 
-    /// Attempts to pop a value from the queue, potentially blocking the current thread.
+    /// Attempts to pop an element from the queue, potentially blocking the current thread.
     ///
     /// If the thread waits for more than `timeout`, `None` is returned.
     pub fn pop_timeout(&self, timeout: Duration) -> Option<T> {

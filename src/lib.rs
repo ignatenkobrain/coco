@@ -2,7 +2,6 @@
 //!
 //! TODO: Explain
 
-// TODO: Explain unsafe impls of Send and Sync
 // TODO: Can `epoch::defer_free` be independent of `Pin`?
 
 extern crate either;
@@ -15,6 +14,5 @@ pub mod epoch;
 pub mod queue;
 pub mod stack;
 
-pub use deque::deque;
 pub use queue::Queue;
 pub use stack::Stack;
