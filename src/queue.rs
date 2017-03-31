@@ -497,6 +497,8 @@ mod tests {
 
     use std::thread;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::Ordering::SeqCst;
 
     use self::rand::Rng;
 
@@ -504,37 +506,170 @@ mod tests {
 
     #[test]
     fn push_pop() {
-        let s = Queue::new();
-        s.push(10);
-        s.push(20);
-        assert_eq!(s.pop(), Some(10));
-        assert_eq!(s.pop(), Some(20));
-        assert_eq!(s.pop(), None);
+        let q = Queue::new();
+        assert!(q.is_empty());
+
+        q.push(10);
+        assert!(!q.is_empty());
+        assert_eq!(q.pop(), Some(10));
+        assert_eq!(q.pop(), None);
+        assert!(q.is_empty());
+
+        q.push(20);
+        q.push(30);
+        assert!(!q.is_empty());
+        assert_eq!(q.pop(), Some(20));
+        assert!(!q.is_empty());
+        assert_eq!(q.pop(), Some(30));
+        assert_eq!(q.pop(), None);
+        assert!(q.is_empty());
     }
 
     #[test]
-    fn simple() {
-        let s = Arc::new(Queue::<i32>::new());
+    fn push_pop_many() {
+        let q = Queue::new();
 
-        let mut handles = vec![];
+        assert!(q.is_empty());
+        for i in 0..1000 {
+            q.push(i);
+            assert!(!q.is_empty());
+        }
 
-        for _ in 0..4 {
-            let s = s.clone();
-            handles.push(thread::spawn(move || {
-                let mut rng = rand::thread_rng();
-                for _ in 0..1_000_000 {
-                    if rng.gen::<usize>() % 2 == 0 {
-                        let x = rng.gen::<i32>();
-                        s.push(x);
-                    } else {
-                        s.pop();
+        for i in 0..1000 {
+            assert!(!q.is_empty());
+            assert_eq!(q.pop(), Some(i));
+        }
+        assert!(q.is_empty());
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn push_pop_spsc() {
+        let COUNT: usize = 50_000;
+
+        let q = Arc::new(Queue::new());
+        let t = {
+            let q = q.clone();
+            thread::spawn(move || {
+                let mut cnt = 0;
+                while cnt < COUNT {
+                    if let Some(x) = q.pop() {
+                        assert_eq!(x, cnt);
+                        cnt += 1;
                     }
                 }
-            }));
+            })
+        };
+
+        for i in 0..COUNT {
+            q.push(i);
         }
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        t.join().unwrap();
+        assert_eq!(q.pop(), None);
     }
+
+    #[test]
+    fn push_pop_spmc() {
+        let COUNT: usize = 50_000;
+
+        let q = Arc::new(Queue::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let popped = Arc::new(AtomicUsize::new(0));
+
+        let threads = (0..8).map(|_| {
+            let q = q.clone();
+            let done = done.clone();
+            let popped = popped.clone();
+
+            thread::spawn(move || {
+                let mut last = 0;
+                loop {
+                    if let Some(x) = q.pop() {
+                        assert!(x > last);
+                        last = x;
+                        popped.fetch_add(1, SeqCst);
+                    } else {
+                        if done.load(SeqCst) {
+                            break;
+                        }
+                    }
+                }
+            })
+        }).collect::<Vec<_>>();
+
+        for i in 0..COUNT {
+            q.push(i + 1);
+        }
+        done.store(true, SeqCst);
+
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(popped.load(SeqCst), COUNT);
+        assert_eq!(q.pop(), None);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn push_pop_mpmc() {
+        let COUNT: usize = 50_000;
+
+        let q = Arc::new(Queue::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let popped = Arc::new(AtomicUsize::new(0));
+
+        let producers = (0..2).map(|mut t| {
+            let q = q.clone();
+            let done = done.clone();
+            let popped = popped.clone();
+
+            thread::spawn(move || {
+                for _ in 0..COUNT {
+                    t += 2;
+                    q.push(t);
+                }
+            })
+        }).collect::<Vec<_>>();
+
+        let consumers = (0..2).map(|mut t| {
+            let q = q.clone();
+            let done = done.clone();
+            let popped = popped.clone();
+
+            thread::spawn(move || {
+                let mut last0 = 0;
+                let mut last1 = 0;
+                loop {
+                    if let Some(x) = q.pop() {
+                        if x % 2 == 0 {
+                            assert!(x > last0);
+                            last0 = x;
+                        } else {
+                            assert!(x > last1);
+                            last1 = x;
+                        }
+                        popped.fetch_add(1, SeqCst);
+                    } else {
+                        if popped.load(SeqCst) == 2 * COUNT {
+                            break;
+                        }
+                    }
+                }
+            })
+        }).collect::<Vec<_>>();
+
+        for t in producers {
+            t.join().unwrap();
+        }
+        for t in consumers {
+            t.join().unwrap();
+        }
+
+        assert_eq!(popped.load(SeqCst), 2 * COUNT);
+        assert_eq!(q.pop(), None);
+        assert!(q.is_empty());
+    }
+
+    // TODO: test pop_wait and pop_timeout
 }
