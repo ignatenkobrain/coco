@@ -1,3 +1,5 @@
+//! TODO
+
 use std::cmp;
 use std::fmt;
 use std::marker::PhantomData;
@@ -7,31 +9,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, fence};
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
 
-use epoch;
-use epoch::Atomic;
+use epoch::{self, Atomic, Pin};
 
-// TODO: Do we need something like `Stealer::steal_half`?
-// https://github.com/crossbeam-rs/crossbeam/pull/72/files
-
-// TODO: A `Stealer::steal_weak` method that may fail?
-
-// 1. Dynamic Circular Work-Stealing Deque
-// 2. Correct and Efficient Work-Stealing for Weak Memory Models
-
-// CDSChecker: Checking Concurrent Data Structures Written with C/C++ Atomics
-// http://plrg.eecs.uci.edu/publications/c11modelcheck.pdf
-// https://github.com/computersforpeace/model-checker-benchmarks/tree/master/chase-lev-deque-bugfix
-
-// TODO: Add {Worker,Stealer}::len() (and watch out for underflow!)
-
+/// Minimum array length for a deque.
 const MIN_LENGTH: usize = 16;
 
+/// A buffer where deque elements get stored.
 struct Array<T> {
+    /// Pointer to the allocated memory.
     ptr: *mut T,
+    /// Length of the array. Always a power of two.
     len: usize,
 }
 
 impl<T> Array<T> {
+    /// Returns a new array with the specified length.
     fn new(len: usize) -> Self {
         let mut v = Vec::with_capacity(len);
         let ptr = v.as_mut_ptr();
@@ -42,17 +34,29 @@ impl<T> Array<T> {
         }
     }
 
+    /// Returns a pointer to the element at the specified `index`.
     unsafe fn at(&self, index: isize) -> *mut T {
         self.ptr.offset(index & (self.len - 1) as isize)
     }
 
+    /// Writes `value` into the specified `index`.
     unsafe fn write(&self, index: isize, value: T) {
         ptr::write(self.at(index), value)
     }
 
+    /// Reads the value from the specified `index`.
     unsafe fn read(&self, index: isize) -> T {
         ptr::read(self.at(index))
     }
+}
+
+fn pin_with_fence<F, T>(f: F) -> T
+    where F: FnOnce(&Pin) -> T
+{
+    if epoch::is_pinned() {
+        fence(SeqCst);
+    }
+    epoch::pin(|pin| f(pin))
 }
 
 struct Deque<T> {
@@ -61,7 +65,16 @@ struct Deque<T> {
     array: Atomic<Array<T>>,
 }
 
+/// A work-stealing deque.
+///
+/// TODO
+/// 1. Dynamic Circular Work-Stealing Deque
+/// 2. Correct and Efficient Work-Stealing for Weak Memory Models
+/// CDSChecker: Checking Concurrent Data Structures Written with C/C++ Atomics
+/// http://plrg.eecs.uci.edu/publications/c11modelcheck.pdf
+/// https://github.com/computersforpeace/model-checker-benchmarks/tree/master/chase-lev-deque-bugfix
 impl<T> Deque<T> {
+    /// Returns a new, empty deque.
     fn new() -> Self {
         Deque {
             bottom: AtomicIsize::new(0),
@@ -70,6 +83,7 @@ impl<T> Deque<T> {
         }
     }
 
+    /// Returns the number of elements in the deque.
     fn len(&self) -> usize {
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
@@ -90,9 +104,10 @@ impl<T> Deque<T> {
         })
     }
 
+    /// Pushes an element onto the bottom of the deque.
     fn push(&self, value: T) {
         unsafe {
-            let mut b = self.bottom.load(Relaxed);
+            let b = self.bottom.load(Relaxed);
             let t = self.top.load(Acquire);
             let mut a = self.array.load_raw(Relaxed);
 
@@ -101,7 +116,6 @@ impl<T> Deque<T> {
 
             if width == len as isize {
                 a = self.resize(a, b, t, 2 * len);
-                b = self.bottom.load(Relaxed);
             }
 
             (*a).write(b, value);
@@ -110,6 +124,7 @@ impl<T> Deque<T> {
         }
     }
 
+    /// Pops an element fron the bottom of the deque.
     fn pop(&self) -> Option<T> {
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
@@ -151,30 +166,48 @@ impl<T> Deque<T> {
         }
     }
 
+    fn steal_helper(&self, b: isize, t: isize, pin: &Pin) -> Result<Option<T>, ()> {
+        if b.wrapping_sub(t) <= 0 {
+            Ok(None)
+        } else {
+            let a = self.array.load(Acquire, pin).unwrap();
+            let value = unsafe { a.read(t) };
+
+            if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) == t {
+                Ok(Some(value))
+            } else {
+                mem::forget(value);
+                Err(())
+            }
+        }
+    }
+
+    /// Steals an element fron the top of the deque.
     fn steal(&self) -> Option<T> {
         let mut t = self.top.load(Acquire);
-        if epoch::is_pinned() {
-            fence(SeqCst);
-        }
-
-        epoch::pin(|pin| {
+        pin_with_fence(|pin| {
             loop {
                 let b = self.bottom.load(Acquire);
-                if b.wrapping_sub(t) <= 0 {
-                    return None;
-                }
 
-                let a = self.array.load(Acquire, pin).unwrap();
-                let value = unsafe { a.read(t) };
-
-                if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) == t {
-                    return Some(value);
+                if let Ok(v) = self.steal_helper(b, t, pin) {
+                    return v;
                 }
-                mem::forget(value);
 
                 t = self.top.load(Acquire);
                 fence(SeqCst);
             }
+        })
+    }
+
+    /// Attempts to steal an element fron the top of the deque.
+    ///
+    /// Returns the stolen value (if there is any) on success, or an error if another thread
+    /// concurrently took the element from the top.
+    fn steal_weak(&self) -> Result<Option<T>, ()> {
+        let mut t = self.top.load(Acquire);
+        pin_with_fence(|pin| {
+            let b = self.bottom.load(Acquire);
+            self.steal_helper(b, t, pin)
         })
     }
 }
@@ -204,14 +237,17 @@ pub struct Worker<T> {
 unsafe impl<T: Send> Send for Worker<T> {}
 
 impl<T> Worker<T> {
+    /// Returns the number of elements in the deque.
     pub fn len(&self) -> usize {
         self.deque.len()
     }
 
+    /// Pushes an element onto the bottom of the deque.
     pub fn push(&self, value: T) {
         self.deque.push(value);
     }
 
+    /// Pops an element fron the bottom of the deque.
     pub fn pop(&self) -> Option<T> {
         self.deque.pop()
     }
@@ -232,12 +268,22 @@ unsafe impl<T: Send> Send for Stealer<T> {}
 unsafe impl<T: Send> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
+    /// Returns the number of elements in the deque.
     pub fn len(&self) -> usize {
         self.deque.len()
     }
 
+    /// Steals an element fron the top of the deque.
     pub fn steal(&self) -> Option<T> {
         self.deque.steal()
+    }
+
+    /// Attempts to steal an element fron the top of the deque.
+    ///
+    /// Returns the stolen value (if there is any) on success, or an error if another thread
+    /// concurrently took the element from the top.
+    pub fn steal_weak(&self) -> Result<Option<T>, ()> {
+        self.deque.steal_weak()
     }
 }
 
@@ -256,7 +302,11 @@ impl<T> fmt::Debug for Stealer<T> {
     }
 }
 
-pub fn deque<T>() -> (Worker<T>, Stealer<T>) {
+/// Returns a new work-stealing deque.
+///
+/// The worker is unique, while stealers can be cloned and distributed among multiple threads.
+/// The deque will be destructed as soon as it's worker and all it's stealers get dropped.
+pub fn new<T>() -> (Worker<T>, Stealer<T>) {
     let d = Arc::new(Deque::new());
     let worker = Worker {
         deque: d.clone(),
@@ -280,11 +330,9 @@ mod tests {
 
     use self::rand::Rng;
 
-    use super::deque;
-
     #[test]
     fn simple() {
-        let (w, s) = deque();
+        let (w, s) = super::new();
         assert_eq!(w.pop(), None);
         assert_eq!(s.steal(), None);
         assert_eq!(w.len(), 0);
@@ -309,7 +357,7 @@ mod tests {
     fn steal_push() {
         const STEPS: usize = 50_000;
 
-        let (w, s) = deque();
+        let (w, s) = super::new();
         let t = thread::spawn(move || {
             for i in 0..STEPS {
                 loop {
@@ -331,7 +379,7 @@ mod tests {
     fn stampede() {
         const COUNT: usize = 50_000;
 
-        let (w, s) = deque();
+        let (w, s) = super::new();
 
         for i in 0..COUNT {
             w.push(Box::new(i + 1));
@@ -372,7 +420,7 @@ mod tests {
     fn stress() {
         const COUNT: usize = 50_000;
 
-        let (w, s) = deque();
+        let (w, s) = super::new();
         let done = Arc::new(AtomicBool::new(false));
         let hits = Arc::new(AtomicUsize::new(0));
 
@@ -419,7 +467,7 @@ mod tests {
     fn no_starvation() {
         const COUNT: usize = 50_000;
 
-        let (w, s) = deque();
+        let (w, s) = super::new();
         let done = Arc::new(AtomicBool::new(false));
 
         let (threads, hits): (Vec<_>, Vec<_>) = (0..8).map(|_| {
@@ -477,7 +525,7 @@ mod tests {
             }
         }
 
-        let (w, s) = deque();
+        let (w, s) = super::new();
 
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let remaining = Arc::new(AtomicUsize::new(COUNT));
