@@ -204,7 +204,7 @@ impl<T> Deque<T> {
     /// Returns the stolen value (if there is any) on success, or an error if another thread
     /// concurrently took the element from the top.
     fn steal_weak(&self) -> Result<Option<T>, ()> {
-        let mut t = self.top.load(Acquire);
+        let t = self.top.load(Acquire);
         pin_with_fence(|pin| {
             let b = self.bottom.load(Acquire);
             self.steal_helper(b, t, pin)
