@@ -1,4 +1,57 @@
-//! TODO
+//! A work-stealing deque.
+//!
+//! There is one worker and possibly multiple stealers per deque. The worker has exclusive access
+//! to one side of the deque and may push and pop elements. Stealers can only steal (i.e. pop)
+//! elements from the other side.
+//!
+//! The implementation is based on the following papers:
+//!
+//! 1. Dynamic Circular Work-Stealing Deque
+//!    <sup>[pdf][chase-lev]</sup>
+//! 2. Correct and Efficient Work-Stealing for Weak Memory Models
+//!    <sup>[pdf][weak-mem]</sup>
+//! 3. CDSChecker: Checking Concurrent Data Structures Written with C/C++ Atomics
+//!    <sup>[pdf][checker] [code][code]</sup>
+//!
+//! [chase-lev]: https://pdfs.semanticscholar.org/3771/77bb82105c35e6e26ebad1698a20688473bd.pdf
+//! [weak-mem]: http://www.di.ens.fr/~zappa/readings/ppopp13.pdf
+//! [checker]: http://plrg.eecs.uci.edu/publications/c11modelcheck.pdf
+//! [code]: https://github.com/computersforpeace/model-checker-benchmarks/tree/master/chase-lev-deque-bugfix
+//!
+//! # Examples
+//!
+//! ```
+//! extern crate coco;
+//!
+//! let (w, s) = coco::deque::new();
+//!
+//! // Create some work.
+//! for i in 0..1000 {
+//!     w.push(i);
+//! }
+//!
+//! let threads = (0..4).map(|_| {
+//!     let s = s.clone();
+//!     std::thread::spawn(move || {
+//!         while let Some(x) = s.steal() {
+//!             // Do something with `x`...
+//!         }
+//!     })
+//! }).collect::<Vec<_>>();
+//!
+//! while let Some(x) = w.pop() {
+//!     // Do something with `x`...
+//!     // Or create even more work...
+//!     if x > 1 {
+//!         w.push(x / 2);
+//!         w.push(x / 2);
+//!     }
+//! }
+//!
+//! for t in threads {
+//!     t.join().unwrap();
+//! }
+//! ```
 
 use std::cmp;
 use std::fmt;
@@ -14,7 +67,7 @@ use epoch::{self, Atomic, Pin};
 /// Minimum buffer capacity for a deque.
 const MIN_CAP: usize = 16;
 
-/// A buffer where deque elements get stored.
+/// A buffer where deque elements are stored.
 struct Buffer<T> {
     /// Pointer to the allocated memory.
     ptr: *mut T,
@@ -51,16 +104,6 @@ impl<T> Buffer<T> {
     }
 }
 
-/// TODO
-fn pin_with_fence<F, T>(f: F) -> T
-    where F: FnOnce(&Pin) -> T
-{
-    if epoch::is_pinned() {
-        fence(SeqCst);
-    }
-    epoch::pin(|pin| f(pin))
-}
-
 struct Deque<T> {
     bottom: AtomicIsize,
     top: AtomicIsize,
@@ -68,14 +111,6 @@ struct Deque<T> {
 }
 
 /// A work-stealing deque.
-///
-/// TODO
-/// 1. Dynamic Circular Work-Stealing Deque
-/// 2. Correct and Efficient Work-Stealing for Weak Memory Models: http://www.di.ens.fr/~zappa/readings/ppopp13.pdf
-///
-/// CDSChecker: Checking Concurrent Data Structures Written with C/C++ Atomics
-/// http://plrg.eecs.uci.edu/publications/c11modelcheck.pdf
-/// https://github.com/computersforpeace/model-checker-benchmarks/tree/master/chase-lev-deque-bugfix
 impl<T> Deque<T> {
     /// Returns a new, empty deque.
     fn new() -> Self {
@@ -88,8 +123,7 @@ impl<T> Deque<T> {
 
     /// Returns the number of elements in the deque.
     ///
-    /// If used concurrently with other operations, the returned number should be considered merely
-    /// a rough estimate.
+    /// If used concurrently with other operations, the returned number is just an estimate.
     fn len(&self) -> usize {
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
@@ -97,7 +131,7 @@ impl<T> Deque<T> {
         cmp::max(b.wrapping_sub(t), 0) as usize
     }
 
-    /// TODO
+    /// Resizes the buffer with new capacity of `new_cap`.
     #[cold]
     unsafe fn resize(&self, new_cap: usize) {
         // Load the bottom, top, and buffer.
@@ -208,70 +242,74 @@ impl<T> Deque<T> {
         }
     }
 
-    /// TODO
-    fn steal_helper(&self, b: isize, t: isize, pin: &Pin) -> Result<Option<T>, ()> {
-        if b.wrapping_sub(t) <= 0 {
-            Ok(None)
-        } else {
-            let a = self.buffer.load(Acquire, pin).unwrap();
-            let value = unsafe { a.read(t) };
-
-            if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) == t {
-                Ok(Some(value))
-            } else {
-                mem::forget(value);
-                Err(())
-            }
-        }
-    }
-
     /// Steals an element from the top of the deque.
     fn steal(&self) -> Option<T> {
+        // Load the top.
         let mut t = self.top.load(Acquire);
-        pin_with_fence(|pin| {
+
+        // A SeqCst fence is needed here.
+        // If the current thread is already pinned (reentrantly), we must manually issue the fence.
+        // Otherwise, the following pinning will issue the fence anyway, so we don't have to.
+        if epoch::is_pinned() {
+            fence(SeqCst);
+        }
+
+        epoch::pin(|pin| {
+            // Loop until we successfully steal an element or find the deque empty.
             loop {
+                // Load the bottom.
                 let b = self.bottom.load(Acquire);
 
-                if let Ok(v) = self.steal_helper(b, t, pin) {
-                    return v;
+                // Is the deque empty?
+                if b.wrapping_sub(t) <= 0 {
+                    return None;
                 }
 
+                // Load the buffer and read the value at the top.
+                let a = self.buffer.load(Acquire, pin).unwrap();
+                let value = unsafe { a.read(t) };
+
+                // Try incrementing the top to steal the value.
+                if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
+                    return Some(value);
+                }
+
+                // We didn't steal this value, forget it.
+                mem::forget(value);
+
+                // Before every iteration of the loop we must load the top, issue a SeqCst fence,
+                // and then load the bottom. Now reload the top and issue the fence.
                 t = self.top.load(Acquire);
                 fence(SeqCst);
             }
-        })
-    }
-
-    /// Attempts to steal an element from the top of the deque.
-    ///
-    /// Returns the stolen value (if there is any) on success, or an error if another thread
-    /// concurrently took the element from the top.
-    fn steal_weak(&self) -> Result<Option<T>, ()> {
-        let t = self.top.load(Acquire);
-        pin_with_fence(|pin| {
-            let b = self.bottom.load(Acquire);
-            self.steal_helper(b, t, pin)
         })
     }
 }
 
 impl<T> Drop for Deque<T> {
     fn drop(&mut self) {
-        let t = self.top.load(Relaxed);
+        // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
-        let a = self.buffer.load_raw(Relaxed);
+        let t = self.top.load(Relaxed);
+        let buffer = self.buffer.load_raw(Relaxed);
 
         unsafe {
-            let a = Box::from_raw(a);
+            // Convert the buffer to a `Box` and destroy it when we go out of scope.
+            let buffer = Box::from_raw(buffer);
+
+            // Go through the buffer from top to bottom and drop all elements in the deque.
             let mut i = t;
             while i != b {
-                drop(a.read(i));
+                ptr::drop_in_place(buffer.at(i));
                 i = i.wrapping_add(1);
             }
         }
     }
 }
 
+/// Worker side of a work-stealing deque.
+///
+/// There is only one worker per deque.
 pub struct Worker<T> {
     deque: Arc<Deque<T>>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
@@ -281,16 +319,54 @@ unsafe impl<T: Send> Send for Worker<T> {}
 
 impl<T> Worker<T> {
     /// Returns the number of elements in the deque.
+    ///
+    /// If used concurrently with other operations, the returned number is just an estimate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate coco;
+    ///
+    /// let (w, _) = coco::deque::new();
+    /// for i in 0..30 {
+    ///     w.push(i);
+    /// }
+    /// assert_eq!(w.len(), 30);
+    /// ```
     pub fn len(&self) -> usize {
         self.deque.len()
     }
 
     /// Pushes an element onto the bottom of the deque.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate coco;
+    ///
+    /// let (w, _) = coco::deque::new();
+    /// w.push(1);
+    /// w.push(2);
+    /// ```
     pub fn push(&self, value: T) {
         self.deque.push(value);
     }
 
     /// Pops an element from the bottom of the deque.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate coco;
+    ///
+    /// let (w, _) = coco::deque::new();
+    /// w.push(1);
+    /// w.push(2);
+    ///
+    /// assert_eq!(w.pop(), Some(2));
+    /// assert_eq!(w.pop(), Some(1));
+    /// assert_eq!(w.pop(), None);
+    /// ```
     pub fn pop(&self) -> Option<T> {
         self.deque.pop()
     }
@@ -302,6 +378,9 @@ impl<T> fmt::Debug for Worker<T> {
     }
 }
 
+/// Stealer side of a work-stealing deque.
+///
+/// Stealers may be cloned in order to create more stealers for the same deque.
 pub struct Stealer<T> {
     deque: Arc<Deque<T>>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
@@ -312,21 +391,41 @@ unsafe impl<T: Send> Sync for Stealer<T> {}
 
 impl<T> Stealer<T> {
     /// Returns the number of elements in the deque.
+    ///
+    /// If used concurrently with other operations, the returned number is just an estimate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate coco;
+    ///
+    /// let (w, _) = coco::deque::new();
+    /// for i in 0..30 {
+    ///     w.push(i);
+    /// }
+    /// assert_eq!(w.len(), 30);
+    /// ```
     pub fn len(&self) -> usize {
         self.deque.len()
     }
 
     /// Steals an element from the top of the deque.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate coco;
+    ///
+    /// let (w, s) = coco::deque::new();
+    /// w.push(1);
+    /// w.push(2);
+    ///
+    /// assert_eq!(s.steal(), Some(1));
+    /// assert_eq!(s.steal(), Some(2));
+    /// assert_eq!(s.steal(), None);
+    /// ```
     pub fn steal(&self) -> Option<T> {
         self.deque.steal()
-    }
-
-    /// Attempts to steal an element from the top of the deque.
-    ///
-    /// Returns the stolen value (if there is any) on success, or an error if another thread
-    /// concurrently took the element from the top.
-    pub fn steal_weak(&self) -> Result<Option<T>, ()> {
-        self.deque.steal_weak()
     }
 }
 
@@ -348,7 +447,25 @@ impl<T> fmt::Debug for Stealer<T> {
 /// Returns a new work-stealing deque.
 ///
 /// The worker is unique, while stealers can be cloned and distributed among multiple threads.
+///
 /// The deque will be destructed as soon as it's worker and all it's stealers get dropped.
+///
+/// # Examples
+///
+/// ```
+/// extern crate coco;
+///
+/// let (w, s1) = coco::deque::new();
+/// let s2 = s1.clone();
+///
+/// w.push('a');
+/// w.push('b');
+/// w.push('c');
+///
+/// assert_eq!(w.pop(), Some('c'));
+/// assert_eq!(s1.steal(), Some('a'));
+/// assert_eq!(s2.steal(), Some('b'));
+/// ```
 pub fn new<T>() -> (Worker<T>, Stealer<T>) {
     let d = Arc::new(Deque::new());
     let worker = Worker {
@@ -371,6 +488,7 @@ mod tests {
     use std::sync::atomic::Ordering::SeqCst;
     use std::thread;
 
+    use epoch;
     use self::rand::Rng;
 
     #[test]
@@ -459,8 +577,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stress() {
+    fn run_stress() {
         const COUNT: usize = 50_000;
 
         let (w, s) = super::new();
@@ -504,6 +621,16 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    #[test]
+    fn stress() {
+        run_stress();
+    }
+
+    #[test]
+    fn stress_pinned() {
+        epoch::pin(|_| run_stress());
     }
 
     #[test]
