@@ -11,32 +11,33 @@ use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
 
 use epoch::{self, Atomic, Pin};
 
-/// Minimum array length for a deque.
-const MIN_LENGTH: usize = 16;
+/// Minimum buffer capacity for a deque.
+const MIN_CAP: usize = 16;
 
 /// A buffer where deque elements get stored.
-struct Array<T> {
+struct Buffer<T> {
     /// Pointer to the allocated memory.
     ptr: *mut T,
-    /// Length of the array. Always a power of two.
-    len: usize,
+    /// Capacity of the buffer. Always a power of two.
+    cap: usize,
 }
 
-impl<T> Array<T> {
-    /// Returns a new array with the specified length.
-    fn new(len: usize) -> Self {
-        let mut v = Vec::with_capacity(len);
+impl<T> Buffer<T> {
+    /// Returns a new buffe with the specified capacity.
+    fn new(cap: usize) -> Self {
+        let mut v = Vec::with_capacity(cap);
         let ptr = v.as_mut_ptr();
         mem::forget(v);
-        Array {
+        Buffer {
             ptr: ptr,
-            len: len,
+            cap: cap,
         }
     }
 
     /// Returns a pointer to the element at the specified `index`.
     unsafe fn at(&self, index: isize) -> *mut T {
-        self.ptr.offset(index & (self.len - 1) as isize)
+        // `self.len` is always a power of two.
+        self.ptr.offset(index & (self.cap - 1) as isize)
     }
 
     /// Writes `value` into the specified `index`.
@@ -50,6 +51,7 @@ impl<T> Array<T> {
     }
 }
 
+/// TODO
 fn pin_with_fence<F, T>(f: F) -> T
     where F: FnOnce(&Pin) -> T
 {
@@ -62,14 +64,15 @@ fn pin_with_fence<F, T>(f: F) -> T
 struct Deque<T> {
     bottom: AtomicIsize,
     top: AtomicIsize,
-    array: Atomic<Array<T>>,
+    buffer: Atomic<Buffer<T>>,
 }
 
 /// A work-stealing deque.
 ///
 /// TODO
 /// 1. Dynamic Circular Work-Stealing Deque
-/// 2. Correct and Efficient Work-Stealing for Weak Memory Models
+/// 2. Correct and Efficient Work-Stealing for Weak Memory Models: http://www.di.ens.fr/~zappa/readings/ppopp13.pdf
+///
 /// CDSChecker: Checking Concurrent Data Structures Written with C/C++ Atomics
 /// http://plrg.eecs.uci.edu/publications/c11modelcheck.pdf
 /// https://github.com/computersforpeace/model-checker-benchmarks/tree/master/chase-lev-deque-bugfix
@@ -79,98 +82,138 @@ impl<T> Deque<T> {
         Deque {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
-            array: Atomic::new(Array::new(MIN_LENGTH)),
+            buffer: Atomic::new(Buffer::new(MIN_CAP)),
         }
     }
 
     /// Returns the number of elements in the deque.
+    ///
+    /// If used concurrently with other operations, the returned number should be considered merely
+    /// a rough estimate.
     fn len(&self) -> usize {
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
+        // The length can be negative because `b` and `t` were loaded without synchronization.
         cmp::max(b.wrapping_sub(t), 0) as usize
     }
 
+    /// TODO
     #[cold]
-    unsafe fn resize(&self, old: *mut Array<T>, b: isize, t: isize, len: usize) -> *mut Array<T> {
-        let new = Array::new(len);
+    unsafe fn resize(&self, new_cap: usize) {
+        // Load the bottom, top, and buffer.
+        let b = self.bottom.load(Relaxed);
+        let t = self.top.load(Relaxed);
+        let buffer = self.buffer.load_raw(Relaxed);
+
+        // Allocate a new buffer.
+        let new = Buffer::new(new_cap);
+
+        // Copy data from the old buffer to the new one.
         let mut i = t;
         while i != b {
-            ptr::copy_nonoverlapping((*old).at(i), new.at(i), 1);
+            ptr::copy_nonoverlapping((*buffer).at(i), new.at(i), 1);
             i = i.wrapping_add(1);
         }
+
+        // Replace the old buffer with the new one.
         epoch::pin(|pin| {
-            epoch::defer_free(old, pin);
-            self.array.store_box(Box::new(new), Release, pin).as_raw()
+            epoch::defer_free(buffer, pin);
+            self.buffer.store_box(Box::new(new), Release, pin).as_raw();
         })
     }
 
     /// Pushes an element onto the bottom of the deque.
     fn push(&self, value: T) {
         unsafe {
+            // Load the bottom, top, and buffer. The buffer doesn't have to be epoch-protected
+            // because the current thread (the worker) is the only one that grows and shrinks it.
             let b = self.bottom.load(Relaxed);
             let t = self.top.load(Acquire);
-            let mut a = self.array.load_raw(Relaxed);
+            let mut buffer = self.buffer.load_raw(Relaxed);
 
-            let width = b.wrapping_sub(t);
-            let len = (*a).len;
+            // Calculate the length of the deque.
+            let len = b.wrapping_sub(t);
 
-            if width == len as isize {
-                a = self.resize(a, b, t, 2 * len);
+            // Is the deque full?
+            let cap = (*buffer).cap;
+            if len >= cap as isize {
+                // Yes. Grow the underlying buffer.
+                self.resize(2 * cap);
+                buffer = self.buffer.load_raw(Relaxed);
             }
 
-            (*a).write(b, value);
+            // Write `value` into the right slot and increment `b`.
+            (*buffer).write(b, value);
             fence(Release);
             self.bottom.store(b.wrapping_add(1), Relaxed);
         }
     }
 
-    /// Pops an element fron the bottom of the deque.
+    /// Pops an element from the bottom of the deque.
     fn pop(&self) -> Option<T> {
+        // Load the bottom.
         let b = self.bottom.load(Relaxed);
-        let t = self.top.load(Relaxed);
-        let width = b.wrapping_sub(t);
 
-        if width <= 0 {
+        // If the deque is empty, return early without incurring the cost of a SeqCst fence.
+        let t = self.top.load(Relaxed);
+        if b.wrapping_sub(t) <= 0 {
             return None;
         }
 
+        // Decrement the bottom.
         let b = b.wrapping_sub(1);
         self.bottom.store(b, Relaxed);
-        let a = self.array.load_raw(Relaxed);
+
+        // Load the buffer. The buffer doesn't have to be epoch-protected because the current
+        // thread (the worker) is the only one that grows and shrinks it.
+        let buffer = self.buffer.load_raw(Relaxed);
 
         fence(SeqCst);
 
+        // Load the top.
         let t = self.top.load(Relaxed);
-        let width = b.wrapping_sub(t);
 
-        if width >= 0 {
-            let mut value = unsafe { Some((*a).read(b)) };
+        // Compute the length after the bottom was decremented.
+        let len = b.wrapping_sub(t);
 
-            if t == b {
-                if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) != t {
+        if len < 0 {
+            // The deque is empty. Restore the bottom back to the original value.
+            self.bottom.store(b.wrapping_add(1), Relaxed);
+            None
+        } else {
+            // Read the value to be popped.
+            let mut value = unsafe { Some((*buffer).read(b)) };
+
+            // Are we popping the last element from the deque?
+            if len == 0 {
+                // Try incrementing the top.
+                if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_err() {
+                    // Failed. We didn't pop anything.
                     mem::forget(value.take());
                 }
+
+                // Restore the bottom back to the original value.
                 self.bottom.store(b.wrapping_add(1), Relaxed);
             } else {
+                // Shrink the buffer if `len` is less than one fourth of `cap`.
                 unsafe {
-                    let len = (*a).len;
-                    if len > MIN_LENGTH && width < len as isize / 4 {
-                        self.resize(a, b, t, len / 2);
+                    let cap = (*buffer).cap;
+                    if cap > MIN_CAP && len < cap as isize / 4 {
+                        self.resize(cap / 2);
                     }
                 }
             }
+
             value
-        } else {
-            self.bottom.store(b.wrapping_add(1), Relaxed);
-            None
         }
     }
 
+    /// TODO
     fn steal_helper(&self, b: isize, t: isize, pin: &Pin) -> Result<Option<T>, ()> {
         if b.wrapping_sub(t) <= 0 {
             Ok(None)
         } else {
-            let a = self.array.load(Acquire, pin).unwrap();
+            let a = self.buffer.load(Acquire, pin).unwrap();
             let value = unsafe { a.read(t) };
 
             if self.top.compare_and_swap(t, t.wrapping_add(1), SeqCst) == t {
@@ -182,7 +225,7 @@ impl<T> Deque<T> {
         }
     }
 
-    /// Steals an element fron the top of the deque.
+    /// Steals an element from the top of the deque.
     fn steal(&self) -> Option<T> {
         let mut t = self.top.load(Acquire);
         pin_with_fence(|pin| {
@@ -199,7 +242,7 @@ impl<T> Deque<T> {
         })
     }
 
-    /// Attempts to steal an element fron the top of the deque.
+    /// Attempts to steal an element from the top of the deque.
     ///
     /// Returns the stolen value (if there is any) on success, or an error if another thread
     /// concurrently took the element from the top.
@@ -216,7 +259,7 @@ impl<T> Drop for Deque<T> {
     fn drop(&mut self) {
         let t = self.top.load(Relaxed);
         let b = self.bottom.load(Relaxed);
-        let a = self.array.load_raw(Relaxed);
+        let a = self.buffer.load_raw(Relaxed);
 
         unsafe {
             let a = Box::from_raw(a);
@@ -247,7 +290,7 @@ impl<T> Worker<T> {
         self.deque.push(value);
     }
 
-    /// Pops an element fron the bottom of the deque.
+    /// Pops an element from the bottom of the deque.
     pub fn pop(&self) -> Option<T> {
         self.deque.pop()
     }
@@ -273,12 +316,12 @@ impl<T> Stealer<T> {
         self.deque.len()
     }
 
-    /// Steals an element fron the top of the deque.
+    /// Steals an element from the top of the deque.
     pub fn steal(&self) -> Option<T> {
         self.deque.steal()
     }
 
-    /// Attempts to steal an element fron the top of the deque.
+    /// Attempts to steal an element from the top of the deque.
     ///
     /// Returns the stolen value (if there is any) on success, or an error if another thread
     /// concurrently took the element from the top.
@@ -331,7 +374,7 @@ mod tests {
     use self::rand::Rng;
 
     #[test]
-    fn simple() {
+    fn smoke() {
         let (w, s) = super::new();
         assert_eq!(w.pop(), None);
         assert_eq!(s.steal(), None);
