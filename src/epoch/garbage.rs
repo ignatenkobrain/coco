@@ -32,7 +32,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use epoch::{self, Atomic, Pin};
+use epoch::{self, Atomic, Pin, Ptr};
 
 /// Maximum number of objects a bag can contain.
 const MAX_OBJECTS: usize = 64;
@@ -77,11 +77,6 @@ impl Bag {
 
     /// Attempts to insert a garbage object into the bag and returns `true` if succeeded.
     pub fn try_insert<T>(&self, destroy: unsafe fn(*mut T), object: *mut T) -> bool {
-        // If the object is null, just pretend it was successfully inserted.
-        if object.is_null() {
-            return true;
-        }
-
         // Erase type `*mut T` and use `*mut u8` instead.
         let destroy: unsafe fn(*mut u8) = unsafe { mem::transmute(destroy) };
         let object = object as *mut u8;
@@ -150,6 +145,32 @@ impl Garbage {
         garbage
     }
 
+    /// Attempts to compare-and-swap the pending bag `old` with a new, empty one.
+    ///
+    /// The return value is a result indicating whether the compare-and-swap successfully installed
+    /// a new bag. On success the new bag is returned. On failure the current more up-to-date
+    /// pending bag is returned.
+    fn replace_pending<'p>(&self, old: Ptr<'p, Bag>, pin: &'p Pin)
+                           -> Result<Ptr<'p, Bag>, Ptr<'p, Bag>> {
+        match self.pending.cas_box(old, Box::new(Bag::new()), AcqRel) {
+            Ok(new) => {
+                if !old.is_null() {
+                    // Push the old bag into the queue.
+                    let bag = unsafe { Box::from_raw(old.as_raw()) };
+                    self.push(bag, pin);
+                }
+
+                // Spare some cycles on garbage collection.
+                // Note: This may itself produce garbage and allocate new bags.
+                epoch::thread::try_advance(pin);
+                self.collect(pin);
+
+                Ok(new)
+            }
+            Err((pending, _)) => Err(pending),
+        }
+    }
+
     /// Adds an `object` that will later be freed.
     pub unsafe fn defer_free<T>(&self, object: *mut T, pin: &Pin) {
         unsafe fn free<T>(ptr: *mut T) {
@@ -182,21 +203,11 @@ impl Garbage {
         let mut pending = self.pending.load(Acquire, pin);
         loop {
             match pending.as_ref() {
-                None => {
-                    // There is no pending bag. Try installing a fresh one.
-                    match self.pending.cas_box(pending, Box::new(Bag::new()), AcqRel) {
+                Some(p) if p.try_insert(destroy, object) => break,
+                _ => {
+                    match self.replace_pending(pending, pin) {
                         Ok(p) => pending = p,
-                        Err((p, _)) => pending = p,
-                    }
-                }
-                Some(p) => {
-                    if p.try_insert(destroy, object) {
-                        // Successfully inserted the object.
-                        break;
-                    } else {
-                        // We couldn't insert, the bag is full. Try installing a fresh bag and
-                        // pushing the old one into the queue.
-                        self.flush(pin);
+                        Err(p) => pending = p,
                     }
                 }
             }
@@ -215,20 +226,12 @@ impl Garbage {
                     None => break,
                     Some(p) => {
                         if p.is_empty() {
-                            // The bag is already empty. Nothing to do.
+                            // The bag is already empty.
                             break;
                         } else {
-                            // Try replacing the pending bag with a fresh one.
-                            let new = Box::new(Bag::new());
-
-                            if self.pending.cas_box(pending, new, AcqRel).is_ok() {
-                                // Spare some cycles on garbage collection.
-                                epoch::thread::try_advance(pin);
-                                self.collect(pin);
-
-                                // Finally, push the old bag into the queue.
-                                let bag = Box::from_raw(pending.as_raw());
-                                self.push(bag, pin);
+                            match self.replace_pending(pending, pin) {
+                                Ok(_) => break,
+                                Err(p) => pending = p,
                             }
                         }
                     }

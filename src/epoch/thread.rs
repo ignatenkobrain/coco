@@ -210,7 +210,7 @@ pub fn try_advance(pin: &Pin) {
                 return;
             }
 
-            // The unlinked entry can be later freed.
+            // The unlinked entry can later be freed.
             unsafe { defer_free(c as *const _ as *mut Thread, pin) }
 
             // Move forward, but don't change the predecessor.
@@ -369,14 +369,14 @@ pub fn flush(pin: &Pin) {
             // The bag is full. We must replace it with a fresh one.
             cell.set(Box::into_raw(Box::new(Bag::new())));
 
-            // Spare some cycles on garbage collection.
-            // Note: This may itself produce garbage and in turn allocate new bags.
-            try_advance(pin);
-            garbage::collect(pin);
-
-            // Finally, push the old bag into the garbage queue.
+            // Push the old bag into the garbage queue.
             let bag = Box::from_raw(bag);
             garbage::push(bag, pin);
+
+            // Spare some cycles on garbage collection.
+            // Note: This may itself produce garbage and allocate new bags.
+            try_advance(pin);
+            garbage::collect(pin);
         }
     }
 }
