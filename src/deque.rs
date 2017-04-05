@@ -152,6 +152,7 @@ impl<T> Deque<T> {
         // Replace the old buffer with the new one.
         epoch::pin(|pin| {
             epoch::defer_free(buffer, pin);
+            epoch::flush(pin);
             self.buffer.store_box(Box::new(new), Release, pin).as_raw();
         })
     }

@@ -2,8 +2,6 @@
 //!
 //! TODO: Explain
 
-// TODO: Can `epoch::defer_free` be independent of `Pin`?
-
 extern crate either;
 
 #[macro_use(defer)]

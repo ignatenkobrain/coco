@@ -32,7 +32,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use epoch::{Atomic, Pin, defer_free};
+use epoch::{self, Atomic, Pin};
 
 /// Maximum number of objects a bag can contain.
 const MAX_OBJECTS: usize = 64;
@@ -68,6 +68,11 @@ impl Bag {
             epoch: unsafe { mem::uninitialized() },
             next: Atomic::null(),
         }
+    }
+
+    /// Returns `true` if the bag is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len.load(Relaxed) == 0
     }
 
     /// Attempts to insert a garbage object into the bag and returns `true` if succeeded.
@@ -191,11 +196,40 @@ impl Garbage {
                     } else {
                         // We couldn't insert, the bag is full. Try installing a fresh bag and
                         // pushing the old one into the queue.
-                        if self.pending.cas_box(pending, Box::new(Bag::new()), AcqRel).is_ok() {
-                            // Success! Push the bag into the queue and collect some garbage.
-                            let bag = Box::from_raw(pending.as_raw());
-                            self.push(bag, pin);
-                            self.collect(pin);
+                        self.flush(pin);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flushes the buffered garbage.
+    ///
+    /// It is wise to flush the garbage just after passing a very large object to one of the
+    /// `defer_*` methods, so that it isn't sitting in the buffer for a long time.
+    pub fn flush(&self, pin: &Pin) {
+        unsafe {
+            let mut pending = self.pending.load(Acquire, pin);
+            loop {
+                match pending.as_ref() {
+                    None => break,
+                    Some(p) => {
+                        if p.is_empty() {
+                            // The bag is already empty. Nothing to do.
+                            break;
+                        } else {
+                            // Try replacing the pending bag with a fresh one.
+                            let new = Box::new(Bag::new());
+
+                            if self.pending.cas_box(pending, new, AcqRel).is_ok() {
+                                // Spare some cycles on garbage collection.
+                                epoch::thread::try_advance(pin);
+                                self.collect(pin);
+
+                                // Finally, push the old bag into the queue.
+                                let bag = Box::from_raw(pending.as_raw());
+                                self.push(bag, pin);
+                            }
                         }
                     }
                 }
@@ -214,10 +248,10 @@ impl Garbage {
 
         let epoch = EPOCH.load(SeqCst);
         let condition = |bag: &Bag| {
-            // A pinned thread can witness at most two epoch advancements. Therefore, any bag that
-            // is within two epochs of the current one cannot be destroyed yet.
+            // A pinned thread can witness at most one epoch advancement. Therefore, any bag that
+            // is within one epoch of the current one cannot be destroyed yet.
             let diff = epoch.wrapping_sub(bag.epoch);
-            cmp::min(diff, 0usize.wrapping_sub(diff)) > 4
+            cmp::min(diff, 0usize.wrapping_sub(diff)) > 2
         };
 
         for _ in 0..COLLECT_STEPS {
@@ -274,7 +308,7 @@ impl Garbage {
                     match self.head.cas_weak(head, next, AcqRel) {
                         Ok(()) => {
                             // The old head may be later freed.
-                            unsafe { defer_free(head.as_raw(), pin) }
+                            unsafe { epoch::defer_free(head.as_raw(), pin) }
                             // The new head holds the popped value (heads are sentinels!).
                             return Some(n);
                         }

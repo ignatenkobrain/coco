@@ -189,7 +189,7 @@ fn participants() -> &'static TaggedAtomic<Thread> {
 /// The global epoch can advance only if all currently pinned threads have been pinned in the
 /// current epoch.
 #[cold]
-fn try_advance(pin: &Pin) {
+pub fn try_advance(pin: &Pin) {
     let epoch = EPOCH.load(SeqCst);
 
     // Traverse the linked list of participating threads.
@@ -326,7 +326,11 @@ pub fn is_pinned() -> bool {
 /// This function inserts the object into a thread-local buffer. When the buffers becomes full,
 /// it's objects are flushed into a globally shared [`Garbage`] instance.
 ///
+/// If the object is unusually large, it is wise to follow up with a call to [`flush`] so that it
+/// doesn't get stuck waiting in the buffer for a long time.
+///
 /// [`Garbage`]: struct.Garbage.html
+/// [`flush`]: fn.flush.html
 pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {
     unsafe fn free<T>(ptr: *mut T) {
         // Free the memory, but don't run the destructor.
@@ -344,16 +348,35 @@ pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {
             break;
         }
 
-        // The bag is full. We must replace it with a fresh one.
-        cell.set(Box::into_raw(Box::new(Bag::new())));
+        // Flush the garbage and create a new bag.
+        flush(pin);
+    }
+}
 
-        // Spare some cycles on garbage collection.
-        // Note: This may itself produce garbage and in turn allocate new bags.
-        try_advance(pin);
-        garbage::collect(pin);
+/// Flushes the buffered thread-local garbage.
+///
+/// It is wise to flush the garbage just after passing a very large object to [`defer_free`], so
+/// that it isn't sitting in the buffer for a long time.
+///
+/// [`defer_free`]: fn.defer_free.html
+pub fn flush(pin: &Pin) {
+    unsafe {
+        // Get the thread-local bag.
+        let cell = &*pin.bag;
+        let bag = cell.get();
 
-        // Finally, push the old bag into the garbage queue.
-        let bag = Box::from_raw(bag);
-        garbage::push(bag, pin);
+        if !(*bag).is_empty() {
+            // The bag is full. We must replace it with a fresh one.
+            cell.set(Box::into_raw(Box::new(Bag::new())));
+
+            // Spare some cycles on garbage collection.
+            // Note: This may itself produce garbage and in turn allocate new bags.
+            try_advance(pin);
+            garbage::collect(pin);
+
+            // Finally, push the old bag into the garbage queue.
+            let bag = Box::from_raw(bag);
+            garbage::push(bag, pin);
+        }
     }
 }
