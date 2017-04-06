@@ -380,3 +380,49 @@ pub fn flush(pin: &Pin) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use super::{EPOCH, HARNESS, defer_free, flush, is_pinned, pin};
+
+    #[test]
+    fn pin_reentrant() {
+        assert!(!is_pinned());
+        pin(|_| {
+            assert!(is_pinned());
+            pin(|_| {
+                assert!(is_pinned());
+            });
+            assert!(is_pinned());
+        });
+        assert!(!is_pinned());
+    }
+
+    #[test]
+    fn flush_local() {
+        for _ in 0..100 {
+            let before = EPOCH.load(SeqCst);
+
+            pin(|pin| {
+                unsafe {
+                    let a = Box::into_raw(Box::new(7));
+                    defer_free(a, pin);
+
+                    HARNESS.with(|h| unsafe {
+                        assert!(!(*h.bag.get()).is_empty());
+                    });
+                    flush(pin);
+                    flush(pin);
+                    HARNESS.with(|h| unsafe {
+                        assert!((*h.bag.get()).is_empty());
+                    });
+                }
+            });
+
+            let after = EPOCH.load(SeqCst);
+            assert!(before != after);
+        }
+    }
+}
