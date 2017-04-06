@@ -384,6 +384,7 @@ pub fn flush(pin: &Pin) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering::SeqCst;
+    use std::thread;
 
     use super::{EPOCH, HARNESS, defer_free, flush, is_pinned, pin};
 
@@ -401,10 +402,8 @@ mod tests {
     }
 
     #[test]
-    fn flush_local() {
+    fn flush_local_garbage() {
         for _ in 0..100 {
-            let before = EPOCH.load(SeqCst);
-
             pin(|pin| {
                 unsafe {
                     let a = Box::into_raw(Box::new(7));
@@ -412,17 +411,30 @@ mod tests {
 
                     HARNESS.with(|h| unsafe {
                         assert!(!(*h.bag.get()).is_empty());
-                    });
-                    flush(pin);
-                    flush(pin);
-                    HARNESS.with(|h| unsafe {
-                        assert!((*h.bag.get()).is_empty());
+
+                        while !(*h.bag.get()).is_empty() {
+                            flush(pin);
+                        }
                     });
                 }
             });
-
-            let after = EPOCH.load(SeqCst);
-            assert!(before != after);
         }
+    }
+
+    #[test]
+    fn garbage_buffering() {
+        HARNESS.with(|h| unsafe {
+            while !(*h.bag.get()).is_empty() {
+                pin(|pin| flush(pin));
+            }
+
+            pin(|pin| {
+                for _ in 0..10 {
+                    let a = Box::into_raw(Box::new(7));
+                    defer_free(a, pin);
+                }
+                assert!(!(*h.bag.get()).is_empty());
+            });
+        });
     }
 }
