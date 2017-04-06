@@ -219,20 +219,18 @@ impl Garbage {
     /// It is wise to flush the garbage just after passing a very large object to one of the
     /// `defer_*` methods, so that it isn't sitting in the buffer for a long time.
     pub fn flush(&self, pin: &Pin) {
-        unsafe {
-            let mut pending = self.pending.load(Acquire, pin);
-            loop {
-                match pending.as_ref() {
-                    None => break,
-                    Some(p) => {
-                        if p.is_empty() {
-                            // The bag is already empty.
-                            break;
-                        } else {
-                            match self.replace_pending(pending, pin) {
-                                Ok(_) => break,
-                                Err(p) => pending = p,
-                            }
+        let mut pending = self.pending.load(Acquire, pin);
+        loop {
+            match pending.as_ref() {
+                None => break,
+                Some(p) => {
+                    if p.is_empty() {
+                        // The bag is already empty.
+                        break;
+                    } else {
+                        match self.replace_pending(pending, pin) {
+                            Ok(_) => break,
+                            Err(p) => pending = p,
                         }
                     }
                 }
@@ -398,4 +396,50 @@ pub fn push(bag: Box<Bag>, pin: &Pin) {
 /// Collects several bags from the global queue and destroys their objects.
 pub fn collect(pin: &Pin) {
     global().collect(pin);
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate rand;
+
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use self::rand::{Rng, thread_rng};
+
+    use super::Garbage;
+    use ::epoch;
+
+    #[test]
+    fn smoke() {
+        let g = Garbage::new();
+        epoch::pin(|pin| {
+            let a = Box::into_raw(Box::new(7));
+            unsafe { g.defer_free(a, pin) }
+            assert!(!g.pending.load(SeqCst, pin).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn flush_garbage() {
+        let g = Garbage::new();
+        let mut rng = thread_rng();
+
+        for _ in 0..100_000 {
+            epoch::pin(|pin| unsafe {
+                let a = Box::into_raw(Box::new(7));
+                g.defer_drop(a, pin);
+
+                if rng.gen_range(0, 100) == 0 {
+                    g.flush(pin);
+                    assert!(g.pending.load(SeqCst, pin).unwrap().is_empty());
+                }
+            });
+        }
+    }
+
+    // TODO: count destructors
+    // TODO: test drops and destroys
+    // TODO: test Drop for Garbage
+    // TODO: test flush
+    // TODO: test collect (push many, check that only some are collected, then drain)
 }
