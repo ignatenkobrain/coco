@@ -386,10 +386,7 @@ pub fn flush(pin: &Pin) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering::SeqCst;
-    use std::thread;
-
-    use super::{EPOCH, HARNESS, defer_free, flush, is_pinned, pin};
+    use super::{HARNESS, defer_free, flush, is_pinned, pin};
 
     #[test]
     fn pin_reentrant() {
@@ -412,7 +409,7 @@ mod tests {
                     let a = Box::into_raw(Box::new(7));
                     defer_free(a, 1, pin);
 
-                    HARNESS.with(|h| unsafe {
+                    HARNESS.with(|h| {
                         assert!(!(*h.bag.get()).is_empty());
 
                         while !(*h.bag.get()).is_empty() {
