@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, fence};
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
 
-use epoch::{self, Atomic, Pin};
+use epoch::{self, Atomic};
 
 /// Minimum buffer capacity for a deque.
 const MIN_CAP: usize = 16;
@@ -117,7 +117,7 @@ impl<T> Deque<T> {
         Deque {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
-            buffer: Atomic::new(Buffer::new(MIN_CAP)),
+            buffer: Atomic::new(Buffer::new(MIN_CAP), 0),
         }
     }
 
@@ -137,7 +137,7 @@ impl<T> Deque<T> {
         // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        let buffer = self.buffer.load_raw(Relaxed);
+        let buffer = self.buffer.load_raw(Relaxed).0;
 
         // Allocate a new buffer.
         let new = Buffer::new(new_cap);
@@ -151,7 +151,7 @@ impl<T> Deque<T> {
 
         epoch::pin(|pin| {
             // Replace the old buffer with the new one.
-            self.buffer.store_box(Box::new(new), Release, pin).as_raw();
+            self.buffer.store_box(Box::new(new), 0, Release, pin).as_raw();
 
             let ptr = (*buffer).ptr;
             let cap = (*buffer).cap;
@@ -175,7 +175,7 @@ impl<T> Deque<T> {
             // because the current thread (the worker) is the only one that grows and shrinks it.
             let b = self.bottom.load(Relaxed);
             let t = self.top.load(Acquire);
-            let mut buffer = self.buffer.load_raw(Relaxed);
+            let mut buffer = self.buffer.load_raw(Relaxed).0;
 
             // Calculate the length of the deque.
             let len = b.wrapping_sub(t);
@@ -185,7 +185,7 @@ impl<T> Deque<T> {
             if len >= cap as isize {
                 // Yes. Grow the underlying buffer.
                 self.resize(2 * cap);
-                buffer = self.buffer.load_raw(Relaxed);
+                buffer = self.buffer.load_raw(Relaxed).0;
             }
 
             // Write `value` into the right slot and increment `b`.
@@ -212,7 +212,7 @@ impl<T> Deque<T> {
 
         // Load the buffer. The buffer doesn't have to be epoch-protected because the current
         // thread (the worker) is the only one that grows and shrinks it.
-        let buffer = self.buffer.load_raw(Relaxed);
+        let buffer = self.buffer.load_raw(Relaxed).0;
 
         fence(SeqCst);
 
@@ -303,7 +303,7 @@ impl<T> Drop for Deque<T> {
         // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        let buffer = self.buffer.load_raw(Relaxed);
+        let buffer = self.buffer.load_raw(Relaxed).0;
 
         unsafe {
             // Go through the buffer from top to bottom and drop all elements in the deque.

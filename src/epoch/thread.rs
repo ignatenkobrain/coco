@@ -20,7 +20,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
-use epoch::TaggedAtomic;
+use epoch::Atomic;
 use epoch::garbage::{self, Bag, EPOCH};
 
 thread_local! {
@@ -84,7 +84,7 @@ struct Thread {
     state: AtomicUsize,
     /// The next thread in the linked list of participants. If the tag is 1, this entry is deleted
     /// and can be unlinked from the list.
-    next: TaggedAtomic<Thread>,
+    next: Atomic<Thread>,
 }
 
 impl Thread {
@@ -134,7 +134,7 @@ impl Thread {
 
         let mut new = Box::new(Thread {
             state: AtomicUsize::new(0),
-            next: TaggedAtomic::null(0),
+            next: Atomic::null(0),
         });
 
         // This code is executing while the thread harness is initializing, so normal pinning would
@@ -179,7 +179,7 @@ impl Thread {
 }
 
 /// Returns a reference to the head pointer of the list of participating threads.
-fn participants() -> &'static TaggedAtomic<Thread> {
+fn participants() -> &'static Atomic<Thread> {
     static PARTICIPANTS: AtomicUsize = ATOMIC_USIZE_INIT;
     unsafe { &*(&PARTICIPANTS as *const _ as *const _) }
 }

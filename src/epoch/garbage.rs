@@ -66,7 +66,7 @@ impl Bag {
             len: AtomicUsize::new(0),
             objects: unsafe { mem::zeroed() },
             epoch: unsafe { mem::uninitialized() },
-            next: Atomic::null(),
+            next: Atomic::null(0),
         }
     }
 
@@ -136,9 +136,9 @@ impl Garbage {
     /// Returns a new, empty garbage queue.
     pub fn new() -> Self {
         let garbage = Garbage {
-            head: Atomic::null(),
-            tail: Atomic::null(),
-            pending: Atomic::null(),
+            head: Atomic::null(0),
+            tail: Atomic::null(0),
+            pending: Atomic::null(0),
         };
 
         // This code may be executing while a thread harness is initializing, so normal pinning
@@ -147,7 +147,7 @@ impl Garbage {
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
         // The head of the queue is always a sentinel entry.
-        let sentinel = garbage.head.store_box(Box::new(Bag::new()), Relaxed, pin);
+        let sentinel = garbage.head.store_box(Box::new(Bag::new()), 0, Relaxed, pin);
         garbage.tail.store(sentinel, Relaxed);
 
         garbage
@@ -160,7 +160,7 @@ impl Garbage {
     /// pending bag is returned.
     fn replace_pending<'p>(&self, old: Ptr<'p, Bag>, pin: &'p Pin)
                            -> Result<Ptr<'p, Bag>, Ptr<'p, Bag>> {
-        match self.pending.cas_box(old, Box::new(Bag::new()), AcqRel) {
+        match self.pending.cas_box(old, Box::new(Bag::new()), 0, AcqRel) {
             Ok(new) => {
                 if !old.is_null() {
                     // Push the old bag into the queue.
@@ -302,7 +302,7 @@ impl Garbage {
             let next = tail.unwrap().next.load(Acquire, pin);
             if next.is_null() {
                 // Try installing the new bag.
-                match tail.unwrap().next.cas_box_weak(next, bag, AcqRel) {
+                match tail.unwrap().next.cas_box_weak(next, bag, 0, AcqRel) {
                     Ok(bag) => {
                         // Tail pointer shouldn't fall behind. Let's move it forward.
                         let _ = self.tail.cas(tail, bag, Release);
@@ -355,17 +355,17 @@ impl Drop for Garbage {
     fn drop(&mut self) {
         unsafe {
             // Load the pending bag, then destroy it and all it's objects.
-            let pending = self.pending.load_raw(Relaxed);
+            let pending = self.pending.load_raw(Relaxed).0;
             if !pending.is_null() {
                 (*pending).destroy_all_objects();
                 drop(Vec::from_raw_parts(pending, 0, 1));
             }
 
             // Destroy all bags and objects in the queue.
-            let mut head = self.head.load_raw(Relaxed);
+            let mut head = self.head.load_raw(Relaxed).0;
             loop {
                 // Load the next bag and destroy the current head.
-                let next = (*head).next.load_raw(Relaxed);
+                let next = (*head).next.load_raw(Relaxed).0;
                 drop(Vec::from_raw_parts(head, 0, 1));
 
                 // If the next node is null, we've reached the end of the queue.
