@@ -35,7 +35,10 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use epoch::{self, Atomic, Pin, Ptr};
 
 /// Maximum number of objects a bag can contain.
+#[cfg(not(test))]
 const MAX_OBJECTS: usize = 64;
+#[cfg(test)]
+const MAX_OBJECTS: usize = 4;
 
 /// The global epoch.
 ///
