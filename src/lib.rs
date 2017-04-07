@@ -8,3 +8,6 @@ extern crate scopeguard;
 
 pub mod deque;
 pub mod epoch;
+pub mod stack;
+
+pub use stack::Stack;
