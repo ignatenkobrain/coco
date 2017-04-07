@@ -149,11 +149,22 @@ impl<T> Deque<T> {
             i = i.wrapping_add(1);
         }
 
-        // Replace the old buffer with the new one.
         epoch::pin(|pin| {
-            epoch::defer_free(buffer, pin);
-            epoch::flush(pin);
+            // Replace the old buffer with the new one.
             self.buffer.store_box(Box::new(new), Release, pin).as_raw();
+
+            let ptr = (*buffer).ptr;
+            let cap = (*buffer).cap;
+
+            // Destroy the old buffer later.
+            epoch::defer_free(ptr, cap, pin);
+            epoch::defer_free(buffer, 1, pin);
+
+            // If the size of the buffer at least than 1KB, then flush the thread-local garbage in
+            // order to destroy it sooner.
+            if mem::size_of::<T>() * cap >= 1 << 10 {
+                epoch::flush(pin);
+            }
         })
     }
 
@@ -295,15 +306,16 @@ impl<T> Drop for Deque<T> {
         let buffer = self.buffer.load_raw(Relaxed);
 
         unsafe {
-            // Convert the buffer to a `Box` and destroy it when we go out of scope.
-            let buffer = Box::from_raw(buffer);
-
             // Go through the buffer from top to bottom and drop all elements in the deque.
             let mut i = t;
             while i != b {
-                ptr::drop_in_place(buffer.at(i));
+                ptr::drop_in_place((*buffer).at(i));
                 i = i.wrapping_add(1);
             }
+
+            // Free the memory allocated by the buffer.
+            drop(Vec::from_raw_parts((*buffer).ptr, 0, (*buffer).cap));
+            drop(Vec::from_raw_parts(buffer, 0, 1));
         }
     }
 }

@@ -211,7 +211,7 @@ pub fn try_advance(pin: &Pin) {
             }
 
             // The unlinked entry can later be freed.
-            unsafe { defer_free(c as *const _ as *mut Thread, pin) }
+            unsafe { defer_free(c as *const _ as *mut Thread, 1, pin) }
 
             // Move forward, but don't change the predecessor.
             curr = succ;
@@ -323,6 +323,9 @@ pub fn is_pinned() -> bool {
 
 /// Stashes away an object that will later be freed.
 ///
+/// The specified object is an array allocated at address `object` and consists of `count` elements
+/// of type `T`.
+///
 /// This function inserts the object into a thread-local buffer. When the buffers becomes full,
 /// it's objects are flushed into a globally shared [`Garbage`] instance.
 ///
@@ -331,10 +334,10 @@ pub fn is_pinned() -> bool {
 ///
 /// [`Garbage`]: struct.Garbage.html
 /// [`flush`]: fn.flush.html
-pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {
-    unsafe fn free<T>(ptr: *mut T) {
-        // Free the memory, but don't run the destructor.
-        drop(Vec::from_raw_parts(ptr, 0, 1));
+pub unsafe fn defer_free<T>(object: *mut T, count: usize, pin: &Pin) {
+    unsafe fn free<T>(ptr: *mut T, count: usize) {
+        // Free the memory, but don't run the destructors.
+        drop(Vec::from_raw_parts(ptr, 0, count));
     }
 
     loop {
@@ -343,7 +346,7 @@ pub unsafe fn defer_free<T>(object: *mut T, pin: &Pin) {
         let bag = cell.get();
 
         // Try inserting the object into the bag.
-        if (*bag).try_insert(free::<T>, object) {
+        if (*bag).try_insert(free::<T>, object, count) {
             // Success! We're done.
             break;
         }
@@ -407,7 +410,7 @@ mod tests {
             pin(|pin| {
                 unsafe {
                     let a = Box::into_raw(Box::new(7));
-                    defer_free(a, pin);
+                    defer_free(a, 1, pin);
 
                     HARNESS.with(|h| unsafe {
                         assert!(!(*h.bag.get()).is_empty());
@@ -431,7 +434,7 @@ mod tests {
             pin(|pin| {
                 for _ in 0..10 {
                     let a = Box::into_raw(Box::new(7));
-                    defer_free(a, pin);
+                    defer_free(a, 1, pin);
                 }
                 assert!(!(*h.bag.get()).is_empty());
             });

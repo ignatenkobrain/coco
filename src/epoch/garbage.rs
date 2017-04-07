@@ -52,7 +52,7 @@ pub struct Bag {
     /// Number of objects in the bag.
     len: AtomicUsize,
     /// Removed objects.
-    objects: [UnsafeCell<(unsafe fn(*mut u8), *mut u8)>; MAX_OBJECTS],
+    objects: [UnsafeCell<(unsafe fn(*mut u8, usize), *mut u8, usize)>; MAX_OBJECTS],
     /// The global epoch at the moment when this bag got pushed into the queue.
     epoch: usize,
     /// The next bag in the queue.
@@ -76,9 +76,10 @@ impl Bag {
     }
 
     /// Attempts to insert a garbage object into the bag and returns `true` if succeeded.
-    pub fn try_insert<T>(&self, destroy: unsafe fn(*mut T), object: *mut T) -> bool {
+    pub fn try_insert<T>(&self, destroy: unsafe fn(*mut T, usize), object: *mut T, count: usize)
+                         -> bool {
         // Erase type `*mut T` and use `*mut u8` instead.
-        let destroy: unsafe fn(*mut u8) = unsafe { mem::transmute(destroy) };
+        let destroy: unsafe fn(*mut u8, usize) = unsafe { mem::transmute(destroy) };
         let object = object as *mut u8;
 
         let mut len = self.len.load(Acquire);
@@ -93,7 +94,7 @@ impl Bag {
                 Ok(_) => {
                     // Success! Now store the garbage object into the array. The current thread
                     // will synchronize with the thread that destroys it through epoch advancement.
-                    unsafe { *self.objects[len].get() = (destroy, object) }
+                    unsafe { *self.objects[len].get() = (destroy, object, count) }
                     return true;
                 }
                 Err(l) => len = l,
@@ -106,8 +107,8 @@ impl Bag {
     /// Note: can be called only once!
     unsafe fn destroy_all_objects(&self) {
         for cell in self.objects.iter().take(self.len.load(Relaxed)) {
-            let (destroy, object) = *cell.get();
-            destroy(object);
+            let (destroy, object, count) = *cell.get();
+            destroy(object, count);
         }
     }
 }
@@ -115,6 +116,13 @@ impl Bag {
 /// A garbage queue.
 ///
 /// This is where a concurrent data structure can store removed objects for deferred destruction.
+///
+/// Stored garbage objects are first kept in the garbage buffer. When the buffer becomes full, it's
+/// objects are flushed into the garbage queue. Flushing can be manually triggered by calling
+/// [`flush`]. Some garbage in the queue can be manually collected by calling [`collect`].
+///
+/// [`flush`]: method.flush.html
+/// [`collect`]: method.collect.html
 pub struct Garbage {
     /// Head of the queue.
     head: Atomic<Bag>,
@@ -171,39 +179,58 @@ impl Garbage {
         }
     }
 
-    /// Adds an `object` that will later be freed.
-    pub unsafe fn defer_free<T>(&self, object: *mut T, pin: &Pin) {
-        unsafe fn free<T>(ptr: *mut T) {
-            // Free the memory, but don't run the destructor.
-            drop(Vec::from_raw_parts(ptr, 0, 1));
+    /// Adds an object that will later be freed.
+    ///
+    /// The specified object is an array allocated at address `object` and consists of `count`
+    /// elements of type `T`.
+    ///
+    /// This method inserts the object into the garbage buffer. When the buffers becomes full, it's
+    /// objects are flushed into the garbage queue.
+    pub unsafe fn defer_free<T>(&self, object: *mut T, count: usize, pin: &Pin) {
+        unsafe fn free<T>(ptr: *mut T, count: usize) {
+            // Free the memory, but don't run the destructors.
+            drop(Vec::from_raw_parts(ptr, 0, count));
         }
-        self.defer_destroy(free, object, pin);
+        self.defer_destroy(free, object, count, pin);
     }
 
-    /// Adds an `object` that will later be dropped and freed.
+    /// Adds an object that will later be dropped and freed.
+    ///
+    /// The specified object is an array allocated at address `object` and consists of `count`
+    /// elements of type `T`.
+    ///
+    /// This method inserts the object into the garbage buffer. When the buffers becomes full, it's
+    /// objects are flushed into the garbage queue.
     ///
     /// Note: The object must be `Send + Sync + 'self`.
-    pub unsafe fn defer_drop<T>(&self, object: *mut T, pin: &Pin) {
-        unsafe fn destruct<T>(ptr: *mut T) {
+    pub unsafe fn defer_drop<T>(&self, object: *mut T, count: usize, pin: &Pin) {
+        unsafe fn destruct<T>(ptr: *mut T, count: usize) {
             // Run the destructor and free the memory.
-            drop(Vec::from_raw_parts(ptr, 1, 1));
+            drop(Vec::from_raw_parts(ptr, count, count));
         }
-        self.defer_destroy(destruct, object, pin);
+        self.defer_destroy(destruct, object, count, pin);
     }
 
-    /// Adds an `object` that will later be destroyed using `destroy`.
+    /// Adds an object that will later be destroyed using `destroy`.
+    ///
+    /// The specified object is an array allocated at address `object` and consists of `count`
+    /// elements of type `T`.
+    ///
+    /// This method inserts the object into the garbage buffer. When the buffers becomes full, it's
+    /// objects are flushed into the garbage queue.
     ///
     /// Note: The object must be `Send + Sync + 'self`.
     pub unsafe fn defer_destroy<T>(
         &self,
-        destroy: unsafe fn(*mut T),
+        destroy: unsafe fn(*mut T, usize),
         object: *mut T,
+        count: usize,
         pin: &Pin
     ) {
         let mut pending = self.pending.load(Acquire, pin);
         loop {
             match pending.as_ref() {
-                Some(p) if p.try_insert(destroy, object) => break,
+                Some(p) if p.try_insert(destroy, object, count) => break,
                 _ => {
                     match self.replace_pending(pending, pin) {
                         Ok(p) => pending = p,
@@ -238,11 +265,13 @@ impl Garbage {
         }
     }
 
-    /// Collects some garbage and destroys it.
+    /// Collects some garbage from the queue and destroys it.
     ///
     /// Generally speaking, it's not necessary to call this method because garbage production
     /// already triggers garbage destruction. However, if there are long periods without garbage
     /// production, it might be a good idea to call this method from time to time.
+    ///
+    /// This method collects several buffers worth of garbage objects.
     pub fn collect(&self, pin: &Pin) {
         /// Number of bags to destroy.
         const COLLECT_STEPS: usize = 8;
@@ -309,7 +338,7 @@ impl Garbage {
                     match self.head.cas_weak(head, next, AcqRel) {
                         Ok(()) => {
                             // The old head may be later freed.
-                            unsafe { epoch::defer_free(head.as_raw(), pin) }
+                            unsafe { epoch::defer_free(head.as_raw(), 1, pin) }
                             // The new head holds the popped value (heads are sentinels!).
                             return Some(n);
                         }
@@ -414,7 +443,7 @@ mod tests {
         let g = Garbage::new();
         epoch::pin(|pin| {
             let a = Box::into_raw(Box::new(7));
-            unsafe { g.defer_free(a, pin) }
+            unsafe { g.defer_free(a, 1, pin) }
             assert!(!g.pending.load(SeqCst, pin).unwrap().is_empty());
         });
     }
@@ -427,7 +456,7 @@ mod tests {
         for _ in 0..100_000 {
             epoch::pin(|pin| unsafe {
                 let a = Box::into_raw(Box::new(7));
-                g.defer_drop(a, pin);
+                g.defer_drop(a, 1, pin);
 
                 if rng.gen_range(0, 100) == 0 {
                     g.flush(pin);

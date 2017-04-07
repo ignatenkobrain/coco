@@ -68,7 +68,7 @@ impl<T> Stack<T> {
                         let next = h.next.load(Acquire, pin);
                         match self.head.cas_weak(head, next, AcqRel) {
                             Ok(_) => unsafe {
-                                epoch::defer_free(head.as_raw(), pin);
+                                epoch::defer_free(head.as_raw(), 1, pin);
                                 return Some(ptr::read(&h.value));
                             },
                             Err(h) => head = h,
@@ -80,6 +80,8 @@ impl<T> Stack<T> {
         })
     }
 }
+
+// TODO: Drop
 
 #[cfg(test)]
 mod tests {

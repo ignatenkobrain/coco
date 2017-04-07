@@ -216,7 +216,7 @@ impl<T> Queue<T> {
 
                                             // Finally, try unlinking the node.
                                             if t.next.cas_weak(next, succ, Release).is_ok() {
-                                                epoch::defer_free(next.as_raw(), pin);
+                                                epoch::defer_free(next.as_raw(), 1, pin);
                                             }
                                             break;
                                         }
@@ -225,7 +225,7 @@ impl<T> Queue<T> {
                                     // This request node is deleted. Try unlinking it.
                                     let succ = succ.with_tag(0);
                                     if t.next.cas_weak(next, succ, Release).is_ok() {
-                                        unsafe { epoch::defer_free(next.as_raw(), pin) }
+                                        unsafe { epoch::defer_free(next.as_raw(), 1, pin) }
                                     }
                                 }
 
@@ -259,7 +259,7 @@ impl<T> Queue<T> {
                                 match inner.head.cas_weak(head, next, AcqRel) {
                                     Ok(_) => unsafe {
                                         // The old head may be later freed.
-                                        epoch::defer_free(head.as_raw(), pin);
+                                        epoch::defer_free(head.as_raw(), 1, pin);
                                         // The new head holds the popped value.
                                         return Some(ptr::read(value));
                                     },
@@ -300,7 +300,7 @@ impl<T> Queue<T> {
                     // This request node is deleted. Try unlinking it.
                     let succ = succ.with_tag(0);
                     match pred.cas_weak(curr, succ, Release) {
-                        Ok(_) => unsafe { epoch::defer_free(curr.as_raw(), pin) },
+                        Ok(_) => unsafe { epoch::defer_free(curr.as_raw(), 1, pin) },
                         Err(_) => continue 'retry,
                     }
 
@@ -369,7 +369,7 @@ impl<T> Queue<T> {
                             match inner.head.cas_weak(head, curr, AcqRel) {
                                 Ok(_) => unsafe {
                                     // The old head may be later freed.
-                                    epoch::defer_free(head.as_raw(), pin);
+                                    epoch::defer_free(head.as_raw(), 1, pin);
                                     // The new head holds the popped value.
                                     return Some(ptr::read(value));
                                 },
@@ -388,7 +388,7 @@ impl<T> Queue<T> {
                         // This request node is deleted. Try unlinking it.
                         let succ = succ.with_tag(0);
                         match pred.cas_weak(curr, succ, Release) {
-                            Ok(_) => unsafe { epoch::defer_free(curr.as_raw(), pin) },
+                            Ok(_) => unsafe { epoch::defer_free(curr.as_raw(), 1, pin) },
                             Err(_) => continue 'retry,
                         }
 
@@ -672,4 +672,5 @@ mod tests {
     }
 
     // TODO: test pop_wait and pop_timeout
+    // TODO: test destructors
 }
