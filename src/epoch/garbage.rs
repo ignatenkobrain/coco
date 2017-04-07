@@ -205,10 +205,10 @@ impl Garbage {
     /// This method inserts the object into the garbage buffer. When the buffers becomes full, it's
     /// objects are flushed into the garbage queue.
     ///
-    /// Note: The object must be `Send + Sync + 'self`.
+    /// Note: The object must be `Send + 'self`.
     pub unsafe fn defer_drop<T>(&self, object: *mut T, count: usize, pin: &Pin) {
         unsafe fn destruct<T>(ptr: *mut T, count: usize) {
-            // Run the destructor and free the memory.
+            // Run the destructors and free the memory.
             drop(Vec::from_raw_parts(ptr, count, count));
         }
         self.defer_destroy(destruct, object, count, pin);
@@ -222,7 +222,7 @@ impl Garbage {
     /// This method inserts the object into the garbage buffer. When the buffers becomes full, it's
     /// objects are flushed into the garbage queue.
     ///
-    /// Note: The object must be `Send + Sync + 'self`.
+    /// Note: The object must be `Send + 'self`.
     pub unsafe fn defer_destroy<T>(
         &self,
         destroy: unsafe fn(*mut T, usize),

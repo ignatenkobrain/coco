@@ -1,3 +1,8 @@
+//! A concurrent stack.
+//!
+//! This is an implementation of the famous Treiber stack, one of the simplest lock-free data
+//! structures.
+
 use std::ptr;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 
