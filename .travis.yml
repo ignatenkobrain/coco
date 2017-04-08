@@ -4,3 +4,15 @@ rust:
   - stable
   - beta
   - nightly
+
+script:
+  - cargo test
+  - cargo test --features gc_strict
+  - |
+    if [ $TRAVIS_RUST_VERSION == nightly ]; then
+        cd sanitize
+        ./run.sh leak --bin stack
+        ./run.sh leak --bin stack --features coco/gc_strict
+        ./run.sh thread --bin stack
+        ./run.sh thread --bin stack --features coco/gc_strict
+    fi

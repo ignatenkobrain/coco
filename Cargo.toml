@@ -14,3 +14,7 @@ scopeguard = "0.3"
 
 [dev-dependencies]
 rand = "0.3"
+
+[features]
+gc_strict = []
+gc_internals = []
