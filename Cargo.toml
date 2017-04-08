@@ -17,5 +17,5 @@ crossbeam = "0.2.0"
 rand = "0.3"
 
 [features]
-gc_strict = []
-gc_internals = []
+strict_gc = []
+internals = []

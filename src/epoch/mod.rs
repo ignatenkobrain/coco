@@ -36,5 +36,5 @@ pub use self::atomic::{Atomic, Ptr};
 pub use self::garbage::Garbage;
 pub use self::thread::{Pin, defer_free, flush, is_pinned, pin};
 
-#[cfg(feature = "gc_internals")]
+#[cfg(feature = "internals")]
 pub use self::garbage::destroy_global;

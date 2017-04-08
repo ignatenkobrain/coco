@@ -8,4 +8,4 @@ rand = "0.3"
 
 [dependencies.coco]
 path = ".."
-features = ["gc_internals"]
+features = ["internals"]

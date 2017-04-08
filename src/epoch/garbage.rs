@@ -35,9 +35,9 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 use epoch::{self, Atomic, Pin, Ptr};
 
 /// Maximum number of objects a bag can contain.
-#[cfg(not(feature = "gc_strict"))]
+#[cfg(not(feature = "strict_gc"))]
 const MAX_OBJECTS: usize = 64;
-#[cfg(feature = "gc_strict")]
+#[cfg(feature = "strict_gc")]
 const MAX_OBJECTS: usize = 4;
 
 /// The global epoch.
@@ -438,7 +438,7 @@ pub fn collect(pin: &Pin) {
 ///
 /// This function may only be called at the very end of the main thread, and only if the main
 /// thread has never been pinned.
-#[cfg(feature = "gc_internals")]
+#[cfg(feature = "internals")]
 pub unsafe fn destroy_global() {
     let global = global() as *const Garbage as *mut Garbage;
     drop(Box::from_raw(global));
