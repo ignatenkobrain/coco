@@ -94,27 +94,23 @@ impl Thread {
     #[inline]
     fn set_pinned(&self, _pin: &Pin) {
         let epoch = EPOCH.load(Relaxed);
-        // Now we must store `epoch` into `self.state`. It's important that any succeeding loads
+        let state = epoch | 1;
+
+        // Now we must store `state` into `self.state`. It's important that any succeeding loads
         // don't get reordered with this store. In order words, this thread's epoch must be fully
         // announced to other threads. Only then it becomes safe to load from the shared memory.
-        store_with_fence(&self.state, epoch | 1);
-
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        fn store_with_fence(dest: &AtomicUsize, value: usize) {
-            dest.store(value, Relaxed);
-            ::std::sync::atomic::fence(SeqCst);
-        }
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        fn store_with_fence(dest: &AtomicUsize, value: usize) {
+        if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
             // On x86 architectures we have a choice:
             // 1. `atomic::fence(SeqCst)`, which compiles to a `mfence` instruction.
             // 2. `compare_and_swap(_, _, SeqCst)`, which compiles to a `lock cmpxchg` instruction.
             //
             // Both instructions have the effect of a full barrier, but the second one seems to be
             // faster in this particular case.
-            let old = dest.load(Relaxed);
-            dest.compare_and_swap(old, value, SeqCst);
+            let previous = self.state.load(Relaxed);
+            self.state.compare_and_swap(previous, state, SeqCst);
+        } else {
+            self.state.store(state, Relaxed);
+            ::std::sync::atomic::fence(SeqCst);
         }
     }
 
