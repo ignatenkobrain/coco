@@ -11,7 +11,6 @@ license = "Apache-2.0/MIT"
 [dependencies]
 either = "1.0"
 scopeguard = "0.3"
-crossbeam = "0.2.0"
 
 [dev-dependencies]
 rand = "0.3"
