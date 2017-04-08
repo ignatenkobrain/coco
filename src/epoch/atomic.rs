@@ -158,7 +158,8 @@ impl<T> Atomic<T> {
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn swap_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering) -> Ptr<'p, T> {
+    pub fn swap_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, _: &'p Pin)
+                        -> Ptr<'p, T> {
         let data = unsafe { Ptr::from_raw(Box::into_raw(new), tag).data };
         unsafe { Ptr::from_data(self.data.swap(data, order)) }
     }
