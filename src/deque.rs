@@ -1,4 +1,4 @@
-//! A work-stealing deque.
+//! A lock-free work-stealing deque.
 //!
 //! There is one worker and possibly multiple stealers per deque. The worker has exclusive access
 //! to one side of the deque and may push and pop elements. Stealers can only steal (i.e. pop)

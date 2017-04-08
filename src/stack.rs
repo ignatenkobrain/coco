@@ -1,4 +1,4 @@
-//! A concurrent stack.
+//! A lock-free stack.
 //!
 //! This is an implementation of the famous Treiber stack, one of the simplest lock-free data
 //! structures.
@@ -16,7 +16,7 @@ struct Node<T> {
     next: Atomic<Node<T>>,
 }
 
-/// A concurrent stack.
+/// A lock-free stack.
 ///
 /// It can be used with multiple producers and multiple consumers at the same time.
 pub struct Stack<T> {

@@ -9,7 +9,23 @@
 //!
 //! # Collections
 //!
-//! TODO
+//! The following collections are available:
+//!
+//! * [`Stack`]: A lock-free stack.
+//! * [`Deque`]: A lock-free work-stealing deque.
+//!
+//! # Which collection should you use?
+//!
+//! ### Use a [`Stack`] when:
+//!
+//! * You want a simple shared collection where objects can be insert and removed.
+//! * You want to avoid performance degradation due to locking.
+//! * You want the first-in first-out order of elements.
+//!
+//! ### Use a [`Deque`] when:
+//!
+//! * You want one thread inserting and removing objects, and multiple threads just removing them.
+//! * You don't care about the order of elements.
 //!
 //! # Garbage collection
 //!
@@ -23,7 +39,7 @@
 //! anymore.
 //!
 //! This crate implements a basic garbage collection mechanism, which is based on epochs (see the
-//! `epoch` module). When an element gets removed from a concurrent collection, it is added into
+//! `epoch` module). When an element gets removed from a concurrent collection, it is inserted into
 //! a pile of garbage and marked with the current epoch. Every time a thread accesses a collection,
 //! it checks the current epoch, attempts to increment it, and destructs some garbage that became
 //! so old that no thread can be referencing it anymore.
@@ -31,6 +47,9 @@
 //! That is the general mechanism behind garbage collection, but the details are a bit more
 //! complicated. Anyhow, garbage collection is designed to be fully automatic and something users
 //! of concurrent collections don't have to worry about.
+//!
+//! [`Stack`]: struct.Stack.html
+//! [`Deque`]: fn.new.html
 
 extern crate either;
 
