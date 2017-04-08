@@ -19,7 +19,7 @@ fn leak_test() {
 
         thread::spawn(move || {
             let mut rng = rand::thread_rng();
-            for i in 0..5_000 {
+            for i in 0..100_000 {
                 if rng.gen_range(0, t + 1) == 0 {
                     s.pop();
                 } else {
@@ -35,10 +35,6 @@ fn leak_test() {
 }
 
 fn main() {
-    thread::spawn(|| {
-        stress_test();
-        leak_test();
-    }).join().unwrap();
-
-    unsafe { epoch::destroy_global() }
+    stress_test();
+    leak_test();
 }

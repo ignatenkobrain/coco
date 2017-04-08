@@ -1,4 +1,4 @@
-//! Epoch-based memory management.
+//! Epoch-based garbage collection.
 // TODO: Explain how EBR is used, with examples
 // TODO: Explain pinning
 // TODO: Explain pointers

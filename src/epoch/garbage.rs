@@ -436,6 +436,7 @@ pub fn collect(pin: &Pin) {
 ///
 /// This function may only be called at the very end of the main thread, and only if the main
 /// thread has never been pinned.
+#[cfg(feature = "gc_internals")]
 pub unsafe fn destroy_global() {
     let global = global() as *const Garbage as *mut Garbage;
     drop(Box::from_raw(global));
