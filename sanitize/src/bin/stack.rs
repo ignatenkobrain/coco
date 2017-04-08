@@ -9,25 +9,26 @@ use std::thread;
 use coco::Stack;
 use rand::Rng;
 
-fn stress_test() {
-}
+fn main() {
+    const THREADS: usize = 8;
 
-fn leak_test() {
     let s = Arc::new(Stack::new());
-    s.push(10);
-    std::mem::forget(s);
-    return;
+    let len = Arc::new(AtomicUsize::new(0));
 
-    let threads = (0..8).map(|t| {
+    let threads = (0..THREADS).map(|t| {
         let s = s.clone();
+        let len = len.clone();
 
         thread::spawn(move || {
             let mut rng = rand::thread_rng();
             for i in 0..100_000 {
                 if rng.gen_range(0, t + 1) == 0 {
-                    s.pop();
+                    if s.pop().is_some() {
+                        len.fetch_sub(1, SeqCst);
+                    }
                 } else {
-                    s.push(i);
+                    s.push(t + THREADS * i);
+                    len.fetch_add(1, SeqCst);
                 }
             }
         })
@@ -36,9 +37,17 @@ fn leak_test() {
     for t in threads {
         t.join().unwrap();
     }
-}
 
-fn main() {
-    stress_test();
-    leak_test();
+    let mut last = [std::usize::MAX; THREADS];
+
+    while !s.is_empty() {
+        let x = s.pop().unwrap();
+        let t = x % THREADS;
+
+        assert!(last[t] > x);
+        last[t] = x;
+
+        len.fetch_sub(1, SeqCst);
+    }
+    assert_eq!(len.load(SeqCst), 0);
 }
