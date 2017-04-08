@@ -122,7 +122,9 @@ impl Bag {
 ///
 /// Stored garbage objects are first kept in the garbage buffer. When the buffer becomes full, it's
 /// objects are flushed into the garbage queue. Flushing can be manually triggered by calling
-/// [`flush`]. Some garbage in the queue can be manually collected by calling [`collect`].
+/// [`flush`].
+///
+/// Some garbage in the queue can be manually collected by calling [`collect`].
 ///
 /// [`flush`]: method.flush.html
 /// [`collect`]: method.collect.html

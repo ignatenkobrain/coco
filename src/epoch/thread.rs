@@ -323,7 +323,7 @@ pub fn is_pinned() -> bool {
 /// of type `T`.
 ///
 /// This function inserts the object into a thread-local buffer. When the buffers becomes full,
-/// it's objects are flushed into a globally shared [`Garbage`] instance.
+/// it's objects are flushed into the globally shared [`Garbage`] instance.
 ///
 /// If the object is unusually large, it is wise to follow up with a call to [`flush`] so that it
 /// doesn't get stuck waiting in the buffer for a long time.
