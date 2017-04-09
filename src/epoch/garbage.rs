@@ -30,7 +30,7 @@ use std::cmp;
 use std::fmt;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
 
 use epoch::{self, Atomic, Pin, Ptr};
 
@@ -152,8 +152,8 @@ impl Garbage {
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
         // The head of the queue is always a sentinel entry.
-        let sentinel = garbage.head.store_box(Box::new(Bag::new()), 0, Relaxed, pin);
-        garbage.tail.store(sentinel, Relaxed);
+        let sentinel = garbage.head.store_box(Box::new(Bag::new()), 0, pin);
+        garbage.tail.store(sentinel);
 
         garbage
     }
@@ -165,7 +165,7 @@ impl Garbage {
     /// pending bag is returned.
     fn replace_pending<'p>(&self, old: Ptr<'p, Bag>, pin: &'p Pin)
                            -> Result<Ptr<'p, Bag>, Ptr<'p, Bag>> {
-        match self.pending.cas_box(old, Box::new(Bag::new()), 0, AcqRel) {
+        match self.pending.cas_box(old, Box::new(Bag::new()), 0) {
             Ok(new) => {
                 if !old.is_null() {
                     // Push the old bag into the queue.
@@ -232,7 +232,7 @@ impl Garbage {
         count: usize,
         pin: &Pin
     ) {
-        let mut pending = self.pending.load(Acquire, pin);
+        let mut pending = self.pending.load(pin);
         loop {
             match pending.as_ref() {
                 Some(p) if p.try_insert(destroy, object, count) => break,
@@ -251,7 +251,7 @@ impl Garbage {
     /// It is wise to flush the garbage just after passing a very large object to one of the
     /// `defer_*` methods, so that it isn't sitting in the buffer for a long time.
     pub fn flush(&self, pin: &Pin) {
-        let mut pending = self.pending.load(Acquire, pin);
+        let mut pending = self.pending.load(pin);
         loop {
             match pending.as_ref() {
                 None => break,
@@ -302,15 +302,15 @@ impl Garbage {
         // Mark the bag with the current epoch.
         bag.epoch = EPOCH.load(SeqCst);
 
-        let mut tail = self.tail.load(Acquire, pin);
+        let mut tail = self.tail.load(pin);
         loop {
-            let next = tail.unwrap().next.load(Acquire, pin);
+            let next = tail.unwrap().next.load(pin);
             if next.is_null() {
                 // Try installing the new bag.
-                match tail.unwrap().next.cas_box_weak(next, bag, 0, AcqRel) {
+                match tail.unwrap().next.cas_box_weak(next, bag, 0) {
                     Ok(bag) => {
                         // Tail pointer shouldn't fall behind. Let's move it forward.
-                        let _ = self.tail.cas(tail, bag, Release);
+                        let _ = self.tail.cas(tail, bag);
                         break;
                     }
                     Err((t, b)) => {
@@ -320,7 +320,7 @@ impl Garbage {
                 }
             } else {
                 // This is not the actual tail. Move the tail pointer forward.
-                match self.tail.cas_weak(tail, next, AcqRel) {
+                match self.tail.cas_weak(tail, next) {
                     Ok(()) => tail = next,
                     Err(t) => tail = t,
                 }
@@ -334,13 +334,13 @@ impl Garbage {
     fn try_pop_if<'p, F>(&self, condition: F, pin: &'p Pin) -> Option<&'p Bag>
         where F: Fn(&Bag) -> bool
     {
-        let mut head = self.head.load(Acquire, pin);
+        let mut head = self.head.load(pin);
         loop {
-            let next = head.unwrap().next.load(Acquire, pin);
+            let next = head.unwrap().next.load(pin);
             match next.as_ref() {
                 Some(n) if condition(n) => {
                     // Try moving the head forward.
-                    match self.head.cas_weak(head, next, AcqRel) {
+                    match self.head.cas_weak(head, next) {
                         Ok(()) => {
                             // The old head may be later freed.
                             unsafe { epoch::defer_free(head.as_raw(), 1, pin) }
@@ -448,8 +448,6 @@ pub unsafe fn destroy_global() {
 mod tests {
     extern crate rand;
 
-    use std::sync::atomic::Ordering::SeqCst;
-
     use self::rand::{Rng, thread_rng};
 
     use super::Garbage;
@@ -461,7 +459,7 @@ mod tests {
         epoch::pin(|pin| {
             let a = Box::into_raw(Box::new(7));
             unsafe { g.defer_free(a, 1, pin) }
-            assert!(!g.pending.load(SeqCst, pin).unwrap().is_empty());
+            assert!(!g.pending.load(pin).unwrap().is_empty());
         });
     }
 
@@ -477,7 +475,7 @@ mod tests {
 
                 if rng.gen_range(0, 100) == 0 {
                     g.flush(pin);
-                    assert!(g.pending.load(SeqCst, pin).unwrap().is_empty());
+                    assert!(g.pending.load(pin).unwrap().is_empty());
                 }
             });
         }

@@ -2,7 +2,7 @@ use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Release};
 
 use epoch::Pin;
 
@@ -93,9 +93,9 @@ impl<T> Atomic<T> {
 
     /// Loads the tagged atomic pointer.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
-    pub fn load<'p>(&self, order: Ordering, _: &'p Pin) -> Ptr<'p, T> {
-        unsafe { Ptr::from_data(self.data.load(order)) }
+    /// This operation uses the `Acquire` ordering.
+    pub fn load<'p>(&self, _: &'p Pin) -> Ptr<'p, T> {
+        unsafe { Ptr::from_data(self.data.load(Acquire)) }
     }
 
     /// Loads the tagged atomic pointer as a raw pointer and a tag.
@@ -108,23 +108,22 @@ impl<T> Atomic<T> {
 
     /// Stores `new` tagged with `tag` into the atomic.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
-    pub fn store<'p>(&self, new: Ptr<'p, T>, order: Ordering) {
-        self.data.store(new.data, order);
+    /// This operation uses the `Release` ordering.
+    pub fn store<'p>(&self, new: Ptr<'p, T>) {
+        self.data.store(new.data, Release);
     }
 
     /// Stores `new` tagged with `tag` into the atomic and returns it.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
+    /// This operation uses the `Release` ordering.
     ///
     /// # Panics
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn store_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, _: &'p Pin)
-                         -> Ptr<'p, T> {
+    pub fn store_box<'p>(&self, new: Box<T>, tag: usize, _: &'p Pin) -> Ptr<'p, T> {
         let ptr = unsafe { Ptr::from_raw(Box::into_raw(new), tag) };
-        self.data.store(ptr.data, order);
+        self.data.store(ptr.data, Release);
         ptr
     }
 
@@ -145,23 +144,22 @@ impl<T> Atomic<T> {
 
     /// Stores `new` into the atomic, returning the old tagged pointer.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
-    pub fn swap<'p>(&self, new: Ptr<'p, T>, order: Ordering) -> Ptr<'p, T> {
-        unsafe { Ptr::from_data(self.data.swap(new.data, order)) }
+    /// This operation uses the `AcqRel` ordering.
+    pub fn swap<'p>(&self, new: Ptr<'p, T>) -> Ptr<'p, T> {
+        unsafe { Ptr::from_data(self.data.swap(new.data, AcqRel)) }
     }
 
     /// Stores `new` tagged with `tag` into the atomic, returning the old tagged pointer.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
+    /// This operation uses the `AcqRel` ordering.
     ///
     /// # Panics
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn swap_box<'p>(&self, new: Box<T>, tag: usize, order: Ordering, _: &'p Pin)
-                        -> Ptr<'p, T> {
+    pub fn swap_box<'p>(&self, new: Box<T>, tag: usize, _: &'p Pin) -> Ptr<'p, T> {
         let data = unsafe { Ptr::from_raw(Box::into_raw(new), tag).data };
-        unsafe { Ptr::from_data(self.data.swap(data, order)) }
+        unsafe { Ptr::from_data(self.data.swap(data, AcqRel)) }
     }
 
     /// Stores `new` tagged with `tag` into the atomic, returning the old tagged pointer.
@@ -172,8 +170,7 @@ impl<T> Atomic<T> {
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub unsafe fn swap_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering)
-                               -> Ptr<'p, T> {
+    pub unsafe fn swap_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering) -> Ptr<'p, T> {
         let data = Ptr::from_raw(new, tag).data;
         Ptr::from_data(self.data.swap(data, order))
     }
@@ -183,10 +180,9 @@ impl<T> Atomic<T> {
     /// The return value is a result indicating whether the new pointer was stored. On failure the
     /// current value of the tagged atomic pointer is returned.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
-    pub fn cas<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>, order: Ordering)
-                   -> Result<(), Ptr<'p, T>> {
-        let previous = self.data.compare_and_swap(current.data, new.data, order);
+    /// This operation uses the `AcqRel` ordering.
+    pub fn cas<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
+        let previous = self.data.compare_and_swap(current.data, new.data, AcqRel);
         if previous == current.data {
             Ok(())
         } else {
@@ -202,15 +198,9 @@ impl<T> Atomic<T> {
     /// This method can sometimes spuriously fail even when comparison succeeds, which can result
     /// in more efficient code on some platforms.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
-    pub fn cas_weak<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>, order: Ordering)
-                        -> Result<(), Ptr<'p, T>> {
-        let failure_order = match order {
-            AcqRel => Acquire,
-            Release => Relaxed,
-            order => order,
-        };
-        match self.data.compare_exchange_weak(current.data, new.data, order, failure_order) {
+    /// This operation uses the `AcqRel` ordering.
+    pub fn cas_weak<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
+        match self.data.compare_exchange_weak(current.data, new.data, AcqRel, Acquire) {
             Ok(_) => Ok(()),
             Err(previous) => unsafe { Err(Ptr::from_data(previous)) },
         }
@@ -222,17 +212,16 @@ impl<T> Atomic<T> {
     /// new pointer is returned. On failure the current value of the tagged atomic pointer and
     /// `new` are returned.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
+    /// This operation uses the `AcqRel` ordering.
     ///
     /// # Panics
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn cas_box<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, tag: usize,
-                       order: Ordering)
+    pub fn cas_box<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, tag: usize)
                        -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
         let new_data = raw_and_tag(new.as_mut(), tag);
-        let previous = self.data.compare_and_swap(current.data, new_data, order);
+        let previous = self.data.compare_and_swap(current.data, new_data, AcqRel);
         if previous == current.data {
             mem::forget(new);
             unsafe { Ok(Ptr::from_data(new_data)) }
@@ -250,22 +239,16 @@ impl<T> Atomic<T> {
     /// This method can sometimes spuriously fail even when comparison succeeds, which can result
     /// in more efficient code on some platforms.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
+    /// This operation uses the `AcqRel` ordering.
     ///
     /// # Panics
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn cas_box_weak<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, tag: usize,
-                            order: Ordering)
+    pub fn cas_box_weak<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, tag: usize)
                             -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
-        let failure_order = match order {
-            AcqRel => Acquire,
-            Release => Relaxed,
-            order => order,
-        };
         let new_data = raw_and_tag(new.as_mut(), tag);
-        match self.data.compare_exchange_weak(current.data, new_data, order, failure_order) {
+        match self.data.compare_exchange_weak(current.data, new_data, AcqRel, Acquire) {
             Ok(_) => {
                 mem::forget(new);
                 unsafe { Ok(Ptr::from_data(new_data)) }

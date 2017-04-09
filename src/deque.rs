@@ -151,7 +151,7 @@ impl<T> Deque<T> {
 
         epoch::pin(|pin| {
             // Replace the old buffer with the new one.
-            self.buffer.store_box(Box::new(new), 0, Release, pin).as_raw();
+            self.buffer.store_box(Box::new(new), 0, pin).as_raw();
 
             let ptr = (*buffer).ptr;
             let cap = (*buffer).cap;
@@ -278,7 +278,7 @@ impl<T> Deque<T> {
                 }
 
                 // Load the buffer and read the value at the top.
-                let a = self.buffer.load(Acquire, pin).unwrap();
+                let a = self.buffer.load(pin).unwrap();
                 let value = unsafe { a.read(t) };
 
                 // Try incrementing the top to steal the value.

@@ -18,7 +18,7 @@
 use std::cell::Cell;
 use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+use std::sync::atomic::Ordering::{Relaxed, Release, SeqCst};
 
 use epoch::Atomic;
 use epoch::garbage::{self, Bag, EPOCH};
@@ -138,12 +138,12 @@ impl Thread {
         // therefore cheat by creating a fake pin.
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
-        let mut head = list.load(Acquire, pin);
+        let mut head = list.load(pin);
         loop {
-            new.next.store(head, Relaxed);
+            new.next.store(head);
 
             // Try installing this thread's entry as the new head.
-            match list.cas_box_weak(head, new, 0, AcqRel) {
+            match list.cas_box_weak(head, new, 0) {
                 Ok(n) => return n.as_raw(),
                 Err((h, n)) => {
                     head = h;
@@ -164,9 +164,9 @@ impl Thread {
         let pin = unsafe { &mem::zeroed::<Pin>() };
 
         // Simply mark the next-pointer in this thread's entry.
-        let mut next = self.next.load(Acquire, pin);
+        let mut next = self.next.load(pin);
         while next.tag() == 0 {
-            match self.next.cas_weak(next, next.with_tag(1), AcqRel) {
+            match self.next.cas_weak(next, next.with_tag(1)) {
                 Ok(()) => break,
                 Err(n) => next = n,
             }
@@ -190,16 +190,16 @@ pub fn try_advance(pin: &Pin) {
 
     // Traverse the linked list of participating threads.
     let mut pred = participants();
-    let mut curr = pred.load(Acquire, pin);
+    let mut curr = pred.load(pin);
 
     while let Some(c) = curr.as_ref() {
-        let succ = c.next.load(Acquire, pin);
+        let succ = c.next.load(pin);
 
         if succ.tag() == 1 {
             // This thread has exited. Try unlinking it from the list.
             let succ = succ.with_tag(0);
 
-            if pred.cas(curr, succ, Release).is_err() {
+            if pred.cas(curr, succ).is_err() {
                 // We lost the race to unlink the thread. Usually that means we should traverse the
                 // list again from the beginning, but since another thread trying to advance the
                 // epoch has won the race, we leave the job to that one.

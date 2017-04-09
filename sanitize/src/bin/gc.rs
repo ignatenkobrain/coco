@@ -3,8 +3,7 @@ extern crate rand;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::Ordering::*;
+use std::sync::atomic::Ordering::Relaxed;
 use std::thread;
 
 use coco::epoch::{self, Atomic};
@@ -17,11 +16,11 @@ fn worker(a: Arc<Atomic<AtomicUsize>>) {
     for _ in 0..1000 {
         epoch::pin(|pin| {
             let val = if rng.gen_range(0, 100) < 10 {
-                a.swap_box(Box::new(AtomicUsize::new(sum)), 0, AcqRel, pin)
+                a.swap_box(Box::new(AtomicUsize::new(sum)), 0, pin)
                  .unwrap()
                  .load(Relaxed)
             } else {
-                a.load(Acquire, pin)
+                a.load(pin)
                  .unwrap()
                  .fetch_add(sum, Relaxed)
             };

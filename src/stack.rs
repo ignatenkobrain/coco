@@ -4,7 +4,7 @@
 //! structures.
 
 use std::ptr;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 
 use epoch::{self, Atomic};
 
@@ -34,7 +34,7 @@ impl<T> Stack<T> {
 
     /// Returns `true` if the stack is empty.
     pub fn is_empty(&self) -> bool {
-        epoch::pin(|pin| self.head.load(Relaxed, pin).is_null())
+        epoch::pin(|pin| self.head.load(pin).is_null())
     }
 
     /// Pushes a new value onto the stack.
@@ -45,10 +45,10 @@ impl<T> Stack<T> {
         });
 
         epoch::pin(|pin| {
-            let mut head = self.head.load(Acquire, pin);
+            let mut head = self.head.load(pin);
             loop {
-                node.next.store(head, Relaxed);
-                match self.head.cas_box_weak(head, node, 0, AcqRel) {
+                node.next.store(head);
+                match self.head.cas_box_weak(head, node, 0) {
                     Ok(_) => break,
                     Err((h, n)) => {
                         head = h;
@@ -64,12 +64,12 @@ impl<T> Stack<T> {
     /// Returns `None` if the stack is empty.
     pub fn pop(&self) -> Option<T> {
         epoch::pin(|pin| {
-            let mut head = self.head.load(Acquire, pin);
+            let mut head = self.head.load(pin);
             loop {
                 match head.as_ref() {
                     Some(h) => {
-                        let next = h.next.load(Acquire, pin);
-                        match self.head.cas_weak(head, next, AcqRel) {
+                        let next = h.next.load(pin);
+                        match self.head.cas_weak(head, next) {
                             Ok(_) => unsafe {
                                 epoch::defer_free(head.as_raw(), 1, pin);
                                 return Some(ptr::read(&h.value));
