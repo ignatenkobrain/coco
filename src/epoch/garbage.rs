@@ -93,7 +93,7 @@ impl Bag {
             }
 
             // Try incrementing `len`.
-            match self.len.compare_exchange_weak(len, len + 1, AcqRel, Acquire) {
+            match self.len.compare_exchange(len, len + 1, AcqRel, Acquire) {
                 Ok(_) => {
                     // Success! Now store the garbage object into the array. The current thread
                     // will synchronize with the thread that destroys it through epoch advancement.
@@ -307,7 +307,7 @@ impl Garbage {
             let next = tail.unwrap().next.load(pin);
             if next.is_null() {
                 // Try installing the new bag.
-                match tail.unwrap().next.cas_box_weak(next, bag, 0) {
+                match tail.unwrap().next.cas_box(next, bag, 0) {
                     Ok(bag) => {
                         // Tail pointer shouldn't fall behind. Let's move it forward.
                         let _ = self.tail.cas(tail, bag);
@@ -320,7 +320,7 @@ impl Garbage {
                 }
             } else {
                 // This is not the actual tail. Move the tail pointer forward.
-                match self.tail.cas_weak(tail, next) {
+                match self.tail.cas(tail, next) {
                     Ok(()) => tail = next,
                     Err(t) => tail = t,
                 }
@@ -340,7 +340,7 @@ impl Garbage {
             match next.as_ref() {
                 Some(n) if condition(n) => {
                     // Try moving the head forward.
-                    match self.head.cas_weak(head, next) {
+                    match self.head.cas(head, next) {
                         Ok(()) => {
                             // The old head may be later freed.
                             unsafe { epoch::defer_free(head.as_raw(), 1, pin) }

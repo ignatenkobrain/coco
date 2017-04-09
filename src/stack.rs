@@ -48,7 +48,7 @@ impl<T> Stack<T> {
             let mut head = self.head.load(pin);
             loop {
                 node.next.store(head);
-                match self.head.cas_box_weak(head, node, 0) {
+                match self.head.cas_box(head, node, 0) {
                     Ok(_) => break,
                     Err((h, n)) => {
                         head = h;
@@ -69,7 +69,7 @@ impl<T> Stack<T> {
                 match head.as_ref() {
                     Some(h) => {
                         let next = h.next.load(pin);
-                        match self.head.cas_weak(head, next) {
+                        match self.head.cas(head, next) {
                             Ok(_) => unsafe {
                                 epoch::defer_free(head.as_raw(), 1, pin);
                                 return Some(ptr::read(&h.value));

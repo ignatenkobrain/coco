@@ -143,7 +143,7 @@ impl Thread {
             new.next.store(head);
 
             // Try installing this thread's entry as the new head.
-            match list.cas_box_weak(head, new, 0) {
+            match list.cas_box(head, new, 0) {
                 Ok(n) => return n.as_raw(),
                 Err((h, n)) => {
                     head = h;
@@ -166,7 +166,7 @@ impl Thread {
         // Simply mark the next-pointer in this thread's entry.
         let mut next = self.next.load(pin);
         while next.tag() == 0 {
-            match self.next.cas_weak(next, next.with_tag(1)) {
+            match self.next.cas(next, next.with_tag(1)) {
                 Ok(()) => break,
                 Err(n) => next = n,
             }
