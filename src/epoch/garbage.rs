@@ -137,6 +137,9 @@ pub struct Garbage {
     pending: Atomic<Bag>,
 }
 
+unsafe impl Send for Garbage {}
+unsafe impl Sync for Garbage {}
+
 impl Garbage {
     /// Returns a new, empty garbage queue.
     pub fn new() -> Self {
@@ -448,6 +451,12 @@ pub unsafe fn destroy_global() {
 mod tests {
     extern crate rand;
 
+    use std::mem;
+    use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::Arc;
+    use std::thread;
+
     use self::rand::{Rng, thread_rng};
 
     use super::Garbage;
@@ -464,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_garbage() {
+    fn flush_pending() {
         let g = Garbage::new();
         let mut rng = thread_rng();
 
@@ -481,9 +490,247 @@ mod tests {
         }
     }
 
-    // TODO: count destructors
-    // TODO: test drops and destroys
-    // TODO: test Drop for Garbage
-    // TODO: test flush
-    // TODO: test collect (push many, check that only some are collected, then drain)
+    #[test]
+    fn incremental() {
+        const COUNT: usize = 100_000;
+        static DESTROYS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            for _ in 0..COUNT {
+                let a = Box::into_raw(Box::new(7i32));
+                unsafe fn destroy(ptr: *mut i32, count: usize) {
+                    drop(Box::from_raw(ptr));
+                    DESTROYS.fetch_add(count, SeqCst);
+                }
+                g.defer_destroy(destroy, a, 1, pin);
+            }
+            g.flush(pin);
+        });
+
+        let mut last = 0;
+
+        while last < COUNT {
+            let curr = DESTROYS.load(SeqCst);
+            assert!(curr - last < 1000);
+            last = curr;
+
+            epoch::pin(|pin| g.collect(pin));
+        }
+        assert!(DESTROYS.load(SeqCst) == COUNT);
+    }
+
+    #[test]
+    fn buffering() {
+        const COUNT: usize = 10;
+        static DESTROYS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            for _ in 0..COUNT {
+                let a = Box::into_raw(Box::new(7i32));
+                unsafe fn destroy(ptr: *mut i32, count: usize) {
+                    drop(Box::from_raw(ptr));
+                    DESTROYS.fetch_add(count, SeqCst);
+                }
+                g.defer_destroy(destroy, a, 1, pin);
+            }
+        });
+
+        for _ in 0..100_000 {
+            epoch::pin(|pin| {
+                g.collect(pin);
+                assert!(DESTROYS.load(SeqCst) < COUNT);
+            });
+        }
+        epoch::pin(|pin| g.flush(pin));
+
+        while DESTROYS.load(SeqCst) < COUNT {
+            epoch::pin(|pin| g.collect(pin));
+        }
+        assert_eq!(DESTROYS.load(SeqCst), COUNT);
+    }
+
+    #[test]
+    fn count_drops() {
+        const COUNT: usize = 100_000;
+        static DROPS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        struct Elem(i32);
+
+        impl Drop for Elem {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, SeqCst);
+            }
+        }
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            for _ in 0..COUNT {
+                let a = Box::into_raw(Box::new(Elem(7i32)));
+                g.defer_drop(a, 1, pin);
+            }
+            g.flush(pin);
+        });
+
+        while DROPS.load(SeqCst) < COUNT {
+            epoch::pin(|pin| g.collect(pin));
+        }
+        assert_eq!(DROPS.load(SeqCst), COUNT);
+    }
+
+    #[test]
+    fn count_destroy() {
+        const COUNT: usize = 100_000;
+        static DESTROYS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            for _ in 0..COUNT {
+                let a = Box::into_raw(Box::new(7i32));
+                unsafe fn destroy(ptr: *mut i32, count: usize) {
+                    drop(Box::from_raw(ptr));
+                    DESTROYS.fetch_add(count, SeqCst);
+                }
+                g.defer_destroy(destroy, a, 1, pin);
+            }
+            g.flush(pin);
+        });
+
+        while DESTROYS.load(SeqCst) < COUNT {
+            epoch::pin(|pin| g.collect(pin));
+        }
+        assert_eq!(DESTROYS.load(SeqCst), COUNT);
+    }
+
+    #[test]
+    fn drop_array() {
+        const COUNT: usize = 700;
+        static DROPS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        struct Elem(i32);
+
+        impl Drop for Elem {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, SeqCst);
+            }
+        }
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            let mut v = Vec::with_capacity(COUNT);
+            for i in 0..COUNT {
+                v.push(Elem(i as i32));
+            }
+
+            g.defer_drop(v.as_mut_ptr(), v.len(), pin);
+            g.flush(pin);
+
+            mem::forget(v);
+        });
+
+        while DROPS.load(SeqCst) < COUNT {
+            epoch::pin(|pin| g.collect(pin));
+        }
+        assert_eq!(DROPS.load(SeqCst), COUNT);
+    }
+
+    #[test]
+    fn destroy_array() {
+        const COUNT: usize = 100_000;
+        static DESTROYS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            let mut v = Vec::with_capacity(COUNT);
+            for i in 0..COUNT {
+                v.push(i as i32);
+            }
+
+            unsafe fn destroy(ptr: *mut i32, count: usize) {
+                assert!(count == COUNT);
+                drop(Vec::from_raw_parts(ptr, count, count));
+                DESTROYS.fetch_add(count, SeqCst);
+            }
+            g.defer_destroy(destroy, v.as_mut_ptr(), v.len(), pin);
+            g.flush(pin);
+
+            mem::forget(v);
+        });
+
+        while DESTROYS.load(SeqCst) < COUNT {
+            epoch::pin(|pin| g.collect(pin));
+        }
+        assert_eq!(DESTROYS.load(SeqCst), COUNT);
+    }
+
+    #[test]
+    fn drop_garbage() {
+        const COUNT: usize = 100_000;
+        static DROPS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        struct Elem(i32);
+
+        impl Drop for Elem {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, SeqCst);
+            }
+        }
+
+        let g = Garbage::new();
+
+        epoch::pin(|pin| unsafe {
+            for _ in 0..COUNT {
+                let a = Box::into_raw(Box::new(Elem(7i32)));
+                g.defer_drop(a, 1, pin);
+            }
+            g.flush(pin);
+        });
+
+        drop(g);
+        assert_eq!(DROPS.load(SeqCst), COUNT);
+    }
+
+    #[test]
+    fn stress() {
+        const THREADS: usize = 8;
+        const COUNT: usize = 100_000;
+        static DROPS: AtomicUsize = ATOMIC_USIZE_INIT;
+
+        struct Elem(i32);
+
+        impl Drop for Elem {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, SeqCst);
+            }
+        }
+
+        let g = Arc::new(Garbage::new());
+
+        let threads = (0..THREADS).map(|_| {
+            let g = g.clone();
+
+            thread::spawn(move || {
+                for _ in 0..COUNT {
+                    epoch::pin(|pin| unsafe {
+                        let a = Box::into_raw(Box::new(Elem(7i32)));
+                        g.defer_drop(a, 1, pin);
+                    });
+                }
+            })
+        }).collect::<Vec<_>>();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        drop(g);
+        assert_eq!(DROPS.load(SeqCst), COUNT * THREADS);
+    }
 }

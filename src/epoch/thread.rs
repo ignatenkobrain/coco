@@ -382,34 +382,39 @@ pub fn flush(pin: &Pin) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HARNESS, defer_free, flush, is_pinned, pin};
+    use std::thread;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    use epoch;
+    use epoch::garbage::EPOCH;
+    use epoch::thread::{HARNESS, try_advance};
 
     #[test]
     fn pin_reentrant() {
-        assert!(!is_pinned());
-        pin(|_| {
-            assert!(is_pinned());
-            pin(|_| {
-                assert!(is_pinned());
+        assert!(!epoch::is_pinned());
+        epoch::pin(|_| {
+            assert!(epoch::is_pinned());
+            epoch::pin(|_| {
+                assert!(epoch::is_pinned());
             });
-            assert!(is_pinned());
+            assert!(epoch::is_pinned());
         });
-        assert!(!is_pinned());
+        assert!(!epoch::is_pinned());
     }
 
     #[test]
     fn flush_local_garbage() {
         for _ in 0..100 {
-            pin(|pin| {
+            epoch::pin(|pin| {
                 unsafe {
                     let a = Box::into_raw(Box::new(7));
-                    defer_free(a, 1, pin);
+                    epoch::defer_free(a, 1, pin);
 
                     HARNESS.with(|h| {
                         assert!(!(*h.bag.get()).is_empty());
 
                         while !(*h.bag.get()).is_empty() {
-                            flush(pin);
+                            epoch::flush(pin);
                         }
                     });
                 }
@@ -421,16 +426,37 @@ mod tests {
     fn garbage_buffering() {
         HARNESS.with(|h| unsafe {
             while !(*h.bag.get()).is_empty() {
-                pin(|pin| flush(pin));
+                epoch::pin(|pin| epoch::flush(pin));
             }
 
-            pin(|pin| {
+            epoch::pin(|pin| {
                 for _ in 0..10 {
                     let a = Box::into_raw(Box::new(7));
-                    defer_free(a, 1, pin);
+                    epoch::defer_free(a, 1, pin);
                 }
                 assert!(!(*h.bag.get()).is_empty());
             });
         });
+    }
+
+    #[test]
+    fn pin_holds_advance() {
+        let threads = (0..8).map(|_| {
+            thread::spawn(|| {
+                for _ in 0..500_000 {
+                    epoch::pin(|pin| {
+                        let before = EPOCH.load(SeqCst);
+                        try_advance(pin);
+                        let after = EPOCH.load(SeqCst);
+
+                        assert!(after.wrapping_sub(before) <= 2);
+                    });
+                }
+            })
+        }).collect::<Vec<_>>();
+
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }
