@@ -1,18 +1,20 @@
 //! Concurrent collections.
 //!
 //! This crate offers several collections that are designed for performance in multithreaded
-//! contexts. They can be freely shared among multiple threads running parallelly, and concurrently
-//! modified without the overhead of locking.
+//! contexts. They can be freely shared among multiple threads running in parallel, and
+//! concurrently modified without the overhead of locking.
 //!
+//! <!--
 //! Some of these data structures are lock-free. Others are not strictly speaking lock-free, but
 //! still scale well with respect to the number of threads accessing them.
+//! -->
 //!
 //! # Collections
 //!
 //! The following collections are available:
 //!
 //! * [`Stack`]: A lock-free stack.
-//! * [`Deque`]: A lock-free work-stealing deque.
+//! * [`deque`]: A lock-free work-stealing deque.
 //!
 //! # Which collection should you use?
 //!
@@ -22,7 +24,7 @@
 //! * You want to avoid performance degradation due to locking.
 //! * You want the first-in first-out order of elements.
 //!
-//! ### Use a [`Deque`] when:
+//! ### Use a [`deque`] when:
 //!
 //! * You want one thread inserting and removing objects, and multiple threads just removing them.
 //! * You don't care about the order of elements.
@@ -49,7 +51,7 @@
 //! of concurrent collections don't have to worry about.
 //!
 //! [`Stack`]: struct.Stack.html
-//! [`Deque`]: fn.new.html
+//! [`deque`]: fn.new.html
 
 extern crate either;
 
