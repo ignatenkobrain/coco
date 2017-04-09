@@ -5,6 +5,10 @@ rust:
   - beta
   - nightly
 
+env:
+    global:
+      - RUST_MIN_STACK=33554432
+
 matrix:
 
 addons:
