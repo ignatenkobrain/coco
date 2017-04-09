@@ -7,7 +7,7 @@ cargo test --features strict_gc
 
 if [[ "$TRAVIS_RUST_VERSION" == "nightly" ]]; then
     cd sanitize
-    tests=$(for f in sanitize/src/bin/*; do f=`basename $f`; echo ${f%.*}; done)
+    tests=$(for f in ./src/bin/*; do f=`basename $f`; echo ${f%.*}; done)
 
     for t in $tests; do
         ./run.sh thread --bin "$t"
