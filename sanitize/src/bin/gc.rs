@@ -28,7 +28,7 @@ fn worker(a: Arc<Atomic<AtomicUsize>>) {
             sum = sum.wrapping_add(val);
         });
 
-        if rng.gen_range(0, 2000) == 0 {
+        if rng.gen_range(0, 1010) == 0 {
             let a = a.clone();
             thread::spawn(move || worker(a)).join().unwrap();
         }
@@ -38,7 +38,7 @@ fn worker(a: Arc<Atomic<AtomicUsize>>) {
 fn main() {
     let a = Arc::new(Atomic::new(AtomicUsize::new(777), 0));
 
-    let threads = (0..50)
+    let threads = (0..10)
         .map(|_| {
             let a = a.clone();
             thread::spawn(move || worker(a))
