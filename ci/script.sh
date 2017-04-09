@@ -18,5 +18,6 @@ sanitization_suite() {
 }
 
 if [[ "$TRAVIS_RUST_VERSION" == "nightly" ]]; then
+    sanitization_suite gc
     sanitization_suite stack
 fi
