@@ -35,7 +35,8 @@ fn worker(a: Arc<Atomic<AtomicUsize>>) {
     }
 }
 
-fn main() {
+#[test]
+fn sanitize_gc() {
     let a = Arc::new(Atomic::new(AtomicUsize::new(777), 0));
 
     let threads = (0..10)

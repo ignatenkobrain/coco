@@ -1,12 +1,12 @@
 extern crate coco;
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::thread;
 
 use coco::deque;
 
-fn main() {
+#[test]
+fn sanitize_deque() {
     let (w, s) = deque::new();
 
     for i in 0..1_000_000 {

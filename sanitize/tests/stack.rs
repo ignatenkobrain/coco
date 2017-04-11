@@ -9,7 +9,8 @@ use std::thread;
 use coco::Stack;
 use rand::Rng;
 
-fn main() {
+#[test]
+fn sanitize_stack() {
     const THREADS: usize = 8;
 
     let s = Arc::new(Stack::new());
