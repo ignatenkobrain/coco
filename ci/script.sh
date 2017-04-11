@@ -11,10 +11,10 @@ if [[ "$TRAVIS_RUST_VERSION" == "nightly" ]]; then
     cargo test
     cargo test --features coco/strict_gc
 
-    for i in {1..10}; do
+    for _ in {1..10}; do
         cargo test --release
     done
-    for i in {1..10}; do
+    for _ in {1..10}; do
         cargo test --release --features coco/strict_gc
     done
 fi

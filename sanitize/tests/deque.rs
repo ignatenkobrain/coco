@@ -1,6 +1,5 @@
 extern crate coco;
 
-use std::sync::atomic::AtomicUsize;
 use std::thread;
 
 use coco::deque;
@@ -23,7 +22,7 @@ fn sanitize_deque() {
         })
     }).collect::<Vec<_>>();
 
-    for i in 0..500_000 {
+    for _ in 0..500_000 {
         w.pop();
     }
 
