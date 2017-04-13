@@ -28,16 +28,45 @@ unsafe impl<T: Send> Sync for Stack<T> {}
 
 impl<T> Stack<T> {
     /// Returns a new, empty stack.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::Stack;
+    ///
+    /// let s = Stack::<i32>::new();
+    /// ```
     pub fn new() -> Self {
         Stack { head: Atomic::null(0) }
     }
 
     /// Returns `true` if the stack is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::Stack;
+    ///
+    /// let s = Stack::new();
+    /// assert!(s.is_empty());
+    /// s.push("hello");
+    /// assert!(!s.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         epoch::pin(|pin| self.head.load(pin).is_null())
     }
 
     /// Pushes a new value onto the stack.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::Stack;
+    ///
+    /// let s = Stack::new();
+    /// s.push(1);
+    /// s.push(2);
+    /// ```
     pub fn push(&self, value: T) {
         let mut node = Box::new(Node {
             value: value,
@@ -62,6 +91,19 @@ impl<T> Stack<T> {
     /// Attemps to pop an value from the stack.
     ///
     /// Returns `None` if the stack is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::Stack;
+    ///
+    /// let s = Stack::new();
+    /// s.push(1);
+    /// s.push(2);
+    /// assert_eq!(s.pop(), Some(2));
+    /// assert_eq!(s.pop(), Some(1));
+    /// assert_eq!(s.pop(), None);
+    /// ```
     pub fn pop(&self) -> Option<T> {
         epoch::pin(|pin| {
             let mut head = self.head.load(pin);
