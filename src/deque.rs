@@ -21,9 +21,9 @@
 //! # Examples
 //!
 //! ```
-//! extern crate coco;
+//! use coco::deque;
 //!
-//! let (w, s) = coco::deque::new();
+//! let (w, s) = deque::new();
 //!
 //! // Create some work.
 //! for i in 0..1000 {
@@ -338,9 +338,9 @@ impl<T> Worker<T> {
     /// # Examples
     ///
     /// ```
-    /// extern crate coco;
+    /// use coco::deque;
     ///
-    /// let (w, _) = coco::deque::new();
+    /// let (w, _) = deque::new();
     /// for i in 0..30 {
     ///     w.push(i);
     /// }
@@ -355,9 +355,9 @@ impl<T> Worker<T> {
     /// # Examples
     ///
     /// ```
-    /// extern crate coco;
+    /// use coco::deque;
     ///
-    /// let (w, _) = coco::deque::new();
+    /// let (w, _) = deque::new();
     /// w.push(1);
     /// w.push(2);
     /// ```
@@ -370,9 +370,9 @@ impl<T> Worker<T> {
     /// # Examples
     ///
     /// ```
-    /// extern crate coco;
+    /// use coco::deque;
     ///
-    /// let (w, _) = coco::deque::new();
+    /// let (w, _) = deque::new();
     /// w.push(1);
     /// w.push(2);
     ///
@@ -410,9 +410,9 @@ impl<T> Stealer<T> {
     /// # Examples
     ///
     /// ```
-    /// extern crate coco;
+    /// use coco::deque;
     ///
-    /// let (w, _) = coco::deque::new();
+    /// let (w, _) = deque::new();
     /// for i in 0..30 {
     ///     w.push(i);
     /// }
@@ -427,9 +427,9 @@ impl<T> Stealer<T> {
     /// # Examples
     ///
     /// ```
-    /// extern crate coco;
+    /// use coco::deque;
     ///
-    /// let (w, s) = coco::deque::new();
+    /// let (w, s) = deque::new();
     /// w.push(1);
     /// w.push(2);
     ///
@@ -466,9 +466,9 @@ impl<T> fmt::Debug for Stealer<T> {
 /// # Examples
 ///
 /// ```
-/// extern crate coco;
+/// use coco::deque;
 ///
-/// let (w, s1) = coco::deque::new();
+/// let (w, s1) = deque::new();
 /// let s2 = s1.clone();
 ///
 /// w.push('a');
