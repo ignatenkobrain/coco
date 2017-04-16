@@ -135,9 +135,9 @@ impl<T> Atomic<T> {
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn store_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering, _: &'p Pin)
-                         -> Ptr<'p, T> {
-        let ptr = unsafe { Ptr::from_raw(new, tag) };
+    pub unsafe fn store_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering, _: &'p Pin)
+                                -> Ptr<'p, T> {
+        let ptr = Ptr::from_raw(new, tag);
         self.data.store(ptr.data, order);
         ptr
     }
