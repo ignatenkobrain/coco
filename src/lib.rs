@@ -50,8 +50,8 @@
 //! complicated. Anyhow, garbage collection is designed to be fully automatic and something users
 //! of concurrent collections don't have to worry about.
 //!
-//! [`Stack`]: struct.Stack.html
-//! [`deque`]: fn.new.html
+//! [`Stack`]: stack/struct.Stack.html
+//! [`deque`]: deque/fn.new.html
 
 extern crate either;
 
