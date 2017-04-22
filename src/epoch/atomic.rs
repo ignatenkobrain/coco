@@ -2,7 +2,7 @@ use std::mem;
 use std::ptr;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Release};
+use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Release, SeqCst};
 
 use epoch::Pin;
 
@@ -135,8 +135,13 @@ impl<T> Atomic<T> {
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub unsafe fn store_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering, _: &'p Pin)
-                                -> Ptr<'p, T> {
+    pub unsafe fn store_raw<'p>(
+        &self,
+        new: *mut T,
+        tag: usize,
+        order: Ordering,
+        _: &'p Pin,
+    ) -> Ptr<'p, T> {
         let ptr = Ptr::from_raw(new, tag);
         self.data.store(ptr.data, order);
         ptr
@@ -181,12 +186,67 @@ impl<T> Atomic<T> {
     /// current value of the tagged atomic pointer is returned.
     ///
     /// This operation uses the `AcqRel` ordering.
-    pub fn cas<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
+    pub fn cas<'p>(
+        &self,
+        current: Ptr<'p, T>,
+        new: Ptr<'p, T>,
+    ) -> Result<(), Ptr<'p, T>> {
         let previous = self.data.compare_and_swap(current.data, new.data, AcqRel);
         if previous == current.data {
             Ok(())
         } else {
             unsafe { Err(Ptr::from_data(previous)) }
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
+    /// current value of the tagged atomic pointer is returned.
+    ///
+    /// This operation uses the `SeqCst` ordering.
+    pub fn cas_sc<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
+        let previous = self.data.compare_and_swap(current.data, new.data, SeqCst);
+        if previous == current.data {
+            Ok(())
+        } else {
+            unsafe { Err(Ptr::from_data(previous)) }
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
+    /// current value of the tagged atomic pointer is returned.
+    ///
+    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
+    /// in more efficient code on some platforms.
+    ///
+    /// This operation uses the `AcqRel` ordering.
+    pub fn cas_weak<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
+        match self.data.compare_exchange_weak(current.data, new.data, AcqRel, Acquire) {
+            Ok(_) => Ok(()),
+            Err(previous) => unsafe { Err(Ptr::from_data(previous)) },
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
+    /// current value of the tagged atomic pointer is returned.
+    ///
+    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
+    /// in more efficient code on some platforms.
+    ///
+    /// This operation uses the `SeqCst` ordering.
+    pub fn cas_weak_sc<'p>(
+        &self,
+        current: Ptr<'p, T>,
+        new: Ptr<'p, T>,
+    ) -> Result<(), Ptr<'p, T>> {
+        match self.data.compare_exchange_weak(current.data, new.data, SeqCst, SeqCst) {
+            Ok(_) => Ok(()),
+            Err(previous) => unsafe { Err(Ptr::from_data(previous)) },
         }
     }
 
@@ -202,8 +262,12 @@ impl<T> Atomic<T> {
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub fn cas_box<'p>(&self, current: Ptr<'p, T>, mut new: Box<T>, tag: usize)
-                       -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
+    pub fn cas_box<'p>(
+        &self,
+        current: Ptr<'p, T>,
+        mut new: Box<T>,
+        tag: usize,
+    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
         let new_data = raw_and_tag(new.as_mut(), tag);
         let previous = self.data.compare_and_swap(current.data, new_data, AcqRel);
         if previous == current.data {
@@ -211,6 +275,96 @@ impl<T> Atomic<T> {
             unsafe { Ok(Ptr::from_data(new_data)) }
         } else {
             unsafe { Err((Ptr::from_data(previous), new)) }
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On success the
+    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
+    /// `new` are returned.
+    ///
+    /// This operation uses the `SeqCst` ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
+    pub fn cas_box_sc<'p>(
+        &self,
+        current: Ptr<'p, T>,
+        mut new: Box<T>,
+        tag: usize,
+    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
+        let new_data = raw_and_tag(new.as_mut(), tag);
+        let previous = self.data.compare_and_swap(current.data, new_data, SeqCst);
+        if previous == current.data {
+            mem::forget(new);
+            unsafe { Ok(Ptr::from_data(new_data)) }
+        } else {
+            unsafe { Err((Ptr::from_data(previous), new)) }
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On success the
+    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
+    /// `new` are returned.
+    ///
+    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
+    /// in more efficient code on some platforms.
+    ///
+    /// This operation uses the `AcqRel` ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
+    pub fn cas_box_weak<'p>(
+        &self,
+        current: Ptr<'p, T>,
+        mut new: Box<T>,
+        tag: usize
+    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
+        let new_data = raw_and_tag(new.as_mut(), tag);
+        match self.data.compare_exchange_weak(current.data, new_data, AcqRel, Acquire) {
+            Ok(_) => {
+                mem::forget(new);
+                unsafe { Ok(Ptr::from_data(new_data)) }
+            }
+            Err(previous) => unsafe { Err((Ptr::from_data(previous), new)) },
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On success the
+    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
+    /// `new` are returned.
+    ///
+    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
+    /// in more efficient code on some platforms.
+    ///
+    /// This operation uses the `AcqRel` ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
+    pub fn cas_box_weak_sc<'p>(
+        &self,
+        current: Ptr<'p, T>,
+        mut new: Box<T>,
+        tag: usize,
+    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
+        let new_data = raw_and_tag(new.as_mut(), tag);
+        match self.data.compare_exchange_weak(current.data, new_data, SeqCst, SeqCst) {
+            Ok(_) => {
+                mem::forget(new);
+                unsafe { Ok(Ptr::from_data(new_data)) }
+            }
+            Err(previous) => unsafe { Err((Ptr::from_data(previous), new)) },
         }
     }
 
@@ -225,8 +379,43 @@ impl<T> Atomic<T> {
     ///
     /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
     /// unaligned.
-    pub unsafe fn cas_raw(&self, current: (*mut T, usize), new: (*mut T, usize), order: Ordering)
-                          -> Result<(), (*mut T, usize)> {
+    pub unsafe fn cas_raw(
+        &self,
+        current: (*mut T, usize),
+        new: (*mut T, usize),
+        order: Ordering,
+    ) -> Result<(), (*mut T, usize)> {
+        let current_data = raw_and_tag(current.0, current.1);
+        let new_data = raw_and_tag(new.0, new.1);
+        let previous = self.data.compare_and_swap(current_data, new_data, order);
+        if previous == current_data {
+            Ok(())
+        } else {
+            let ptr = Ptr::from_data(previous);
+            Err((ptr.as_raw(), ptr.tag()))
+        }
+    }
+
+    /// If the tagged atomic pointer is equal to `current`, stores `new`.
+    ///
+    /// The return value is a result indicating whether the new pointer was stored. On failure the
+    /// current value of the tagged atomic pointer is returned.
+    ///
+    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
+    /// in more efficient code on some platforms.
+    ///
+    /// Argument `order` describes the memory ordering of this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
+    /// unaligned.
+    pub unsafe fn cas_raw_weak(
+        &self,
+        current: (*mut T, usize),
+        new: (*mut T, usize),
+        order: Ordering,
+    ) -> Result<(), (*mut T, usize)> {
         let current_data = raw_and_tag(current.0, current.1);
         let new_data = raw_and_tag(new.0, new.1);
         let previous = self.data.compare_and_swap(current_data, new_data, order);
