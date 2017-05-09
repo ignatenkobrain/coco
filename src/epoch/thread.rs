@@ -34,6 +34,9 @@ thread_local! {
         is_pinned: Cell::new(false),
         pin_count: Cell::new(0),
         bag: Cell::new(Box::into_raw(Box::new(Bag::new()))),
+
+        last: Cell::new(0),
+        repeated: Cell::new(0),
     };
 }
 
@@ -47,6 +50,9 @@ struct Harness {
     pin_count: Cell<usize>,
     /// The local bag of objects that will be later freed.
     bag: Cell<*mut Bag>,
+
+    last: Cell<usize>,
+    repeated: Cell<usize>,
 }
 
 impl Drop for Harness {
@@ -278,6 +284,8 @@ pub fn pin<F, T>(f: F) -> T
     const PINS_BETWEEN_COLLECT: usize = 128;
 
     HARNESS.with(|harness| {
+        // let guard = LOCK.read().unwrap();
+
         let thread = unsafe { &*harness.thread };
         let pin = &Pin { bag: &harness.bag };
 
@@ -293,6 +301,14 @@ pub fn pin<F, T>(f: F) -> T
 
             // If the counter progressed enough, try advancing the epoch and collecting garbage.
             if count % PINS_BETWEEN_COLLECT == 0 {
+                let epoch = EPOCH.load(SeqCst);
+                if epoch == harness.last.get() {
+                    harness.repeated.set(harness.repeated.get() + 1);
+                } else {
+                    harness.last.set(epoch);
+                    harness.repeated.set(0);
+                }
+
                 try_advance(pin);
                 garbage::collect(pin);
             }
@@ -301,9 +317,24 @@ pub fn pin<F, T>(f: F) -> T
         // This will unpin the thread even if `f` panics.
         defer! {
             if !was_pinned {
+                let count = harness.pin_count.get().wrapping_sub(1);
+                let delay =
+                    harness.repeated.get() >= 8
+                    && EPOCH.load(SeqCst) | 1 == thread.state.load(Relaxed)
+                    && garbage::is_blocked(pin);
+
                 // Unpin the thread.
                 thread.set_unpinned();
+                if delay {
+                    thread.set_pinned(pin);
+                    try_advance(pin);
+                    thread.set_unpinned();
+                }
                 harness.is_pinned.set(false);
+
+                if delay {
+                    ::std::thread::yield_now();
+                }
             }
         }
 

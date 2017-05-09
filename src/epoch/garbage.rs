@@ -273,6 +273,27 @@ impl Garbage {
         }
     }
 
+    pub fn is_blocked(&self, pin: &Pin) -> bool {
+        let epoch = EPOCH.load(SeqCst);
+        let condition = |bag: &Bag| {
+            // A pinned thread can witness at most one epoch advancement. Therefore, any bag that
+            // is within one epoch of the current one cannot be destroyed yet.
+            let diff = epoch.wrapping_sub(bag.epoch);
+            cmp::min(diff, 0usize.wrapping_sub(diff)) > 2
+        };
+
+        for _ in 0..8 {
+            match self.try_pop_if(&condition, pin) {
+                None => {
+                    let head = self.head.load(pin);
+                    return !head.unwrap().next.load(pin).is_null();
+                }
+                Some(bag) => unsafe { bag.destroy_all_objects() },
+            }
+        }
+        false
+    }
+
     /// Collects some garbage from the queue and destroys it.
     ///
     /// Generally speaking, it's not necessary to call this method because garbage production
@@ -433,6 +454,11 @@ pub fn push(bag: Box<Bag>, pin: &Pin) {
 /// Collects several bags from the global queue and destroys their objects.
 pub fn collect(pin: &Pin) {
     global().collect(pin);
+}
+
+/// Collects several bags from the global queue and destroys their objects.
+pub fn is_blocked(pin: &Pin) -> bool {
+    global().is_blocked(pin)
 }
 
 /// Destroys the global garbage.
