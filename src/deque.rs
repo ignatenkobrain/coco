@@ -296,6 +296,27 @@ impl<T> Deque<T> {
             }
         })
     }
+
+    /// Steals an element from the top of the deque, but only the worker may call this method.
+    fn steal_as_worker(&self) -> Option<T> {
+        let b = self.bottom.load(Relaxed);
+        let a = self.buffer.load_raw(Relaxed).0;
+
+        // Loop until we successfully steal an element or find the deque empty.
+        loop {
+            let t = self.top.load(Relaxed);
+
+            // Is the deque empty?
+            if b.wrapping_sub(t) <= 0 {
+                return None;
+            }
+
+            // Try incrementing the top to steal the value.
+            if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
+                return unsafe { Some((*a).read(t)) };
+            }
+        }
+    }
 }
 
 impl<T> Drop for Deque<T> {
@@ -382,6 +403,25 @@ impl<T> Worker<T> {
     /// ```
     pub fn pop(&self) -> Option<T> {
         self.deque.pop()
+    }
+
+    /// Steals an element from the top of the deque.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::deque;
+    ///
+    /// let (w, _) = deque::new();
+    /// w.push(1);
+    /// w.push(2);
+    ///
+    /// assert_eq!(w.steal(), Some(1));
+    /// assert_eq!(w.steal(), Some(2));
+    /// assert_eq!(w.steal(), None);
+    /// ```
+    pub fn steal(&self) -> Option<T> {
+        self.deque.steal_as_worker()
     }
 }
 
@@ -525,6 +565,14 @@ mod tests {
         assert_eq!(s.steal(), Some(2));
         assert_eq!(s.steal(), None);
         assert_eq!(w.pop(), None);
+
+        w.push(3);
+        w.push(4);
+        w.push(5);
+        assert_eq!(w.steal(), Some(3));
+        assert_eq!(s.steal(), Some(4));
+        assert_eq!(w.steal(), Some(5));
+        assert_eq!(w.steal(), None);
     }
 
     #[test]
