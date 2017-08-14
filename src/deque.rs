@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+use std::cell::UnsafeCell;
 use std::cmp;
 use std::fmt;
 use std::marker::PhantomData;
@@ -62,35 +63,46 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, fence};
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
 
-use epoch::{self, Atomic};
+use epoch::{self, Atomic, Owned, Ptr};
 
-/// Minimum buffer capacity for a deque.
-const MIN_CAP: usize = 16;
+use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::slice;
 
-/// A buffer where deque elements are stored.
-struct Buffer<T> {
-    /// Pointer to the allocated memory.
-    ptr: *mut T,
-    /// Capacity of the buffer. Always a power of two.
-    cap: usize,
+// TODO: Add is_empty()
+
+#[repr(C)]
+struct Array<T> {
+    len: usize,
+    elems: [UnsafeCell<T>; 0],
 }
 
-impl<T> Buffer<T> {
-    /// Returns a new buffe with the specified capacity.
-    fn new(cap: usize) -> Self {
-        let mut v = Vec::with_capacity(cap);
-        let ptr = v.as_mut_ptr();
-        mem::forget(v);
-        Buffer {
-            ptr: ptr,
-            cap: cap,
-        }
+impl<T> Array<T> {
+    fn cap_u64(len: usize) -> usize {
+        let size_u64 = mem::size_of::<u64>();
+        let bytes = mem::size_of::<Self>() + mem::size_of::<T>() * len;
+        (bytes + size_u64 - 1) / size_u64
     }
 
-    /// Returns a pointer to the element at the specified `index`.
+    unsafe fn allocate(len: usize) -> *mut Self {
+        assert!(mem::align_of::<Self>() <= mem::align_of::<u64>());
+
+        let cap = Self::cap_u64(len);
+        let v = Vec::<u64>::with_capacity(cap);
+        let ptr = v.as_ptr() as *mut Self;
+        mem::forget(v);
+
+        (*ptr).len = len;
+        ptr
+    }
+
+    unsafe fn deallocate(ptr: *mut Self) {
+        let cap = Self::cap_u64((*ptr).len);
+        Vec::<u64>::from_raw_parts(ptr as *mut u64, 0, cap);
+    }
+
     unsafe fn at(&self, index: isize) -> *mut T {
         // `self.len` is always a power of two.
-        self.ptr.offset(index & (self.cap - 1) as isize)
+        (*self.elems.get_unchecked(index as usize & (self.len - 1))).get()
     }
 
     /// Writes `value` into the specified `index`.
@@ -104,20 +116,64 @@ impl<T> Buffer<T> {
     }
 }
 
-struct Deque<T> {
+/// Minimum buffer capacity for a deque.
+const MIN_CAP: usize = 16;
+
+// /// A buffer where deque elements are stored.
+// struct Buffer<T> {
+//     /// Pointer to the allocated memory.
+//     ptr: *mut T,
+//     /// Capacity of the buffer. Always a power of two.
+//     cap: usize,
+//     // TODO: _marker: PhantomData<T>,
+// }
+//
+// impl<T> Buffer<T> {
+//     /// Returns a new buffe with the specified capacity.
+//     fn new(cap: usize) -> Self {
+//         let mut v = Vec::with_capacity(cap);
+//         let ptr = v.as_mut_ptr();
+//         mem::forget(v);
+//         Buffer {
+//             ptr: ptr,
+//             cap: cap,
+//         }
+//     }
+//
+//     /// Returns a pointer to the element at the specified `index`.
+//     unsafe fn at(&self, index: isize) -> *mut T {
+//         // `self.len` is always a power of two.
+//         self.ptr.offset(index & (self.cap - 1) as isize)
+//     }
+//
+//     /// Writes `value` into the specified `index`.
+//     unsafe fn write(&self, index: isize, value: T) {
+//         ptr::write(self.at(index), value)
+//     }
+//
+//     /// Reads the value from the specified `index`.
+//     unsafe fn read(&self, index: isize) -> T {
+//         ptr::read(self.at(index))
+//     }
+// }
+
+struct Inner<T> {
     bottom: AtomicIsize,
     top: AtomicIsize,
-    buffer: Atomic<Buffer<T>>,
+    buffer: Atomic<Array<T>>,
 }
 
 /// A work-stealing deque.
-impl<T> Deque<T> {
+impl<T> Inner<T> {
     /// Returns a new, empty deque.
     fn new() -> Self {
-        Deque {
-            bottom: AtomicIsize::new(0),
-            top: AtomicIsize::new(0),
-            buffer: Atomic::new(Buffer::new(MIN_CAP), 0),
+        unsafe {
+            let a = Array::<T>::allocate(MIN_CAP);
+            Inner {
+                bottom: AtomicIsize::new(0),
+                top: AtomicIsize::new(0),
+                buffer: Atomic::from_owned(Owned::from_raw(a)),
+            }
         }
     }
 
@@ -137,28 +193,29 @@ impl<T> Deque<T> {
         // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        let buffer = self.buffer.load_raw(Relaxed).0;
+        let buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
 
         // Allocate a new buffer.
-        let new = Buffer::new(new_cap);
+        let new = Array::<T>::allocate(new_cap);
 
         // Copy data from the old buffer to the new one.
         let mut i = t;
         while i != b {
-            ptr::copy_nonoverlapping((*buffer).at(i), new.at(i), 1);
+            ptr::copy_nonoverlapping((*buffer).at(i), (*new).at(i), 1);
             i = i.wrapping_add(1);
         }
 
         epoch::pin(|pin| {
             // Replace the old buffer with the new one.
-            self.buffer.store_box(Box::new(new), 0, pin).as_raw();
+            self.buffer.store(Ptr::from_raw(new), Release);
 
-            let ptr = (*buffer).ptr;
-            let cap = (*buffer).cap;
+            // let ptr = (*buffer).ptr;
+            let cap = (*buffer).len;
 
             // Destroy the old buffer later.
-            epoch::defer_free(ptr, cap, pin);
-            epoch::defer_free(buffer, 1, pin);
+            // epoch::defer_free(ptr, cap, pin);
+            // epoch::defer_free(buffer, 1, pin);
+            //epoch::defer_free(buffer as *const u8, total_bytes::<Array<T>, T>(cap), pin);
 
             // If the size of the buffer at least than 1KB, then flush the thread-local garbage in
             // order to destroy it sooner.
@@ -175,17 +232,17 @@ impl<T> Deque<T> {
             // because the current thread (the worker) is the only one that grows and shrinks it.
             let b = self.bottom.load(Relaxed);
             let t = self.top.load(Acquire);
-            let mut buffer = self.buffer.load_raw(Relaxed).0;
+            let mut buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
 
             // Calculate the length of the deque.
             let len = b.wrapping_sub(t);
 
             // Is the deque full?
-            let cap = (*buffer).cap;
+            let cap = (*buffer).len;
             if len >= cap as isize {
                 // Yes. Grow the underlying buffer.
-                self.resize(2 * cap);
-                buffer = self.buffer.load_raw(Relaxed).0;
+                self.resize(cap.checked_mul(2).expect("overflow"));
+                buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
             }
 
             // Write `value` into the right slot and increment `b`.
@@ -212,7 +269,9 @@ impl<T> Deque<T> {
 
         // Load the buffer. The buffer doesn't have to be epoch-protected because the current
         // thread (the worker) is the only one that grows and shrinks it.
-        let buffer = self.buffer.load_raw(Relaxed).0;
+        let buffer = unsafe {
+            epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw())
+        };
 
         fence(SeqCst);
 
@@ -243,7 +302,7 @@ impl<T> Deque<T> {
             } else {
                 // Shrink the buffer if `len` is less than one fourth of `cap`.
                 unsafe {
-                    let cap = (*buffer).cap;
+                    let cap = (*buffer).len;
                     if cap > MIN_CAP && len < cap as isize / 4 {
                         self.resize(cap / 2);
                     }
@@ -278,7 +337,7 @@ impl<T> Deque<T> {
                 }
 
                 // Load the buffer and read the value at the top.
-                let a = self.buffer.load(pin).unwrap();
+                let a = unsafe { self.buffer.load(Acquire, pin).deref() };
                 let value = unsafe { a.read(t) };
 
                 // Try incrementing the top to steal the value.
@@ -300,7 +359,9 @@ impl<T> Deque<T> {
     /// Steals an element from the top of the deque, but only the worker may call this method.
     fn steal_as_worker(&self) -> Option<T> {
         let b = self.bottom.load(Relaxed);
-        let a = self.buffer.load_raw(Relaxed).0;
+        let buffer = unsafe {
+            epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw())
+        };
 
         // Loop until we successfully steal an element or find the deque empty.
         loop {
@@ -313,20 +374,20 @@ impl<T> Deque<T> {
 
             // Try incrementing the top to steal the value.
             if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
-                return unsafe { Some((*a).read(t)) };
+                return unsafe { Some((*buffer).read(t)) };
             }
         }
     }
 }
 
-impl<T> Drop for Deque<T> {
+impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
         // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        let buffer = self.buffer.load_raw(Relaxed).0;
-
         unsafe {
+            let buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
+
             // Go through the buffer from top to bottom and drop all elements in the deque.
             let mut i = t;
             while i != b {
@@ -335,23 +396,31 @@ impl<T> Drop for Deque<T> {
             }
 
             // Free the memory allocated by the buffer.
-            drop(Vec::from_raw_parts((*buffer).ptr, 0, (*buffer).cap));
-            drop(Vec::from_raw_parts(buffer, 0, 1));
+            // drop(Vec::from_raw_parts((*buffer).ptr, 0, (*buffer).cap));
+            // drop(Vec::from_raw_parts(buffer as *mut Buffer<T>, 0, 1));
+            //Vec::from_raw_parts(buffer as *mut u8, 0, total_bytes::<Array<T>, T>((*buffer).len));
         }
     }
 }
 
-/// Worker side of a work-stealing deque.
+/// Deque side of a work-stealing deque.
 ///
 /// There is only one worker per deque.
-pub struct Worker<T> {
-    deque: Arc<Deque<T>>,
+pub struct Deque<T> {
+    deque: Arc<Inner<T>>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
-unsafe impl<T: Send> Send for Worker<T> {}
+unsafe impl<T: Send> Send for Deque<T> {}
 
-impl<T> Worker<T> {
+impl<T> Deque<T> {
+    pub fn new() -> Self {
+        Deque {
+            deque: Arc::new(Inner::new()),
+            _marker: PhantomData,
+        }
+    }
+
     /// Returns the number of elements in the deque.
     ///
     /// If used concurrently with other operations, the returned number is just an estimate.
@@ -423,11 +492,18 @@ impl<T> Worker<T> {
     pub fn steal(&self) -> Option<T> {
         self.deque.steal_as_worker()
     }
+
+    pub fn stealer(&self) -> Stealer<T> {
+        Stealer {
+            deque: self.deque.clone(),
+            _marker: PhantomData,
+        }
+    }
 }
 
-impl<T> fmt::Debug for Worker<T> {
+impl<T> fmt::Debug for Deque<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Worker {{ ... }}")
+        write!(f, "Deque {{ ... }}")
     }
 }
 
@@ -435,7 +511,7 @@ impl<T> fmt::Debug for Worker<T> {
 ///
 /// Stealers may be cloned in order to create more stealers for the same deque.
 pub struct Stealer<T> {
-    deque: Arc<Deque<T>>,
+    deque: Arc<Inner<T>>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
@@ -519,9 +595,9 @@ impl<T> fmt::Debug for Stealer<T> {
 /// assert_eq!(s1.steal(), Some('a'));
 /// assert_eq!(s2.steal(), Some('b'));
 /// ```
-pub fn new<T>() -> (Worker<T>, Stealer<T>) {
-    let d = Arc::new(Deque::new());
-    let worker = Worker {
+pub fn new<T>() -> (Deque<T>, Stealer<T>) {
+    let d = Arc::new(Inner::new());
+    let worker = Deque {
         deque: d.clone(),
         _marker: PhantomData,
     };
@@ -543,6 +619,8 @@ mod tests {
 
     use epoch;
     use self::rand::Rng;
+
+    use super::Deque;
 
     #[test]
     fn smoke() {
@@ -756,7 +834,8 @@ mod tests {
             }
         }
 
-        let (w, s) = super::new();
+        let w = Deque::new();
+        let s = w.stealer();
 
         let dropped = Arc::new(Mutex::new(Vec::new()));
         let remaining = Arc::new(AtomicUsize::new(COUNT));

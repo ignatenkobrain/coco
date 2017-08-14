@@ -32,9 +32,9 @@ mod atomic;
 mod garbage;
 mod thread;
 
-pub use self::atomic::{Atomic, Ptr};
+pub use self::atomic::{Atomic, Owned, Ptr};
 pub use self::garbage::Garbage;
-pub use self::thread::{Pin, defer_free, flush, is_pinned, pin};
+pub use self::thread::{Scope, defer_free, flush, is_pinned, pin, unprotected};
 
 #[cfg(feature = "internals")]
 pub use self::garbage::destroy_global;

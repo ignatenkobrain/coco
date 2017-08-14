@@ -1,450 +1,573 @@
-use std::mem;
-use std::ptr;
 use std::marker::PhantomData;
+use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Release, SeqCst};
+use std::sync::atomic::Ordering;
 
-use epoch::Pin;
+use epoch::Scope;
 
-/// Returns a mask containing unused least significant bits of an aligned pointer to `T`.
+/// Given ordering for the success case in a compare-exchange operation, returns the strongest
+/// appropriate ordering for the failure case.
+#[inline]
+fn strongest_failure_ordering(ord: Ordering) -> Ordering {
+    use self::Ordering::*;
+    match ord {
+        Relaxed => Relaxed,
+        Release => Relaxed,
+        Acquire => Acquire,
+        AcqRel => Acquire,
+        SeqCst => SeqCst,
+        _ => SeqCst,
+    }
+}
+
+/// Panics if the pointer is not properly unaligned.
+#[inline]
+fn ensure_aligned<T>(raw: *const T) {
+    assert!(raw as usize & low_bits::<T>() == 0, "unaligned pointer");
+}
+
+/// Returns a bitmask containing the unused least significant bits of an aligned pointer to `T`.
+#[inline]
 fn low_bits<T>() -> usize {
     (1 << mem::align_of::<T>().trailing_zeros()) - 1
 }
 
-/// Tags the unused least significant bits of `raw` with `tag`.
-///
-/// # Panics
-///
-/// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-/// unaligned.
-fn raw_and_tag<T>(raw: *mut T, tag: usize) -> usize {
+/// Given a tagged pointer `data`, returns the same pointer, but tagged with `tag`.
+/// Panics if the tag doesn't fit into the unused bits of the pointer.
+#[inline]
+fn data_with_tag<T>(data: usize, tag: usize) -> usize {
     let mask = low_bits::<T>();
-    assert!(raw as usize & mask == 0, "unaligned pointer");
     assert!(tag <= mask, "tag too large to fit into the unused bits: {} > {}", tag, mask);
-    raw as usize | tag
+    (data & !mask) | tag
 }
 
-/// A tagged atomic nullable pointer.
+/// An atomic pointer that can be safely shared between threads.
 ///
-/// The tag is stored into the unused least significant bits of the pointer. The pointer must be
-/// properly aligned.
+/// The pointer must be properly aligned. Since it is aligned, a tag can be stored into the unused
+/// least significant bits of the address.
+///
+/// Any method that loads the pointer must be passed a reference to a [`Scope`].
+///
+/// [`Scope`]: struct.Scope.html
 #[derive(Debug)]
 pub struct Atomic<T> {
     data: AtomicUsize,
-    _marker: PhantomData<*mut T>, // !Send + !Sync
+    _marker: PhantomData<*mut T>,
 }
 
 unsafe impl<T: Send + Sync> Send for Atomic<T> {}
 unsafe impl<T: Send + Sync> Sync for Atomic<T> {}
 
+/// Panics if the tag doesn't fit into the unused bits of an aligned pointer to `T`.
+#[inline]
+fn validate_tag<T>(tag: usize) {
+    let mask = low_bits::<T>();
+    assert!(
+        tag <= mask,
+        "tag too large to fit into the unused bits: {} > {}",
+        tag,
+        mask
+    );
+}
+
 impl<T> Atomic<T> {
-    /// Constructs a tagged atomic pointer from raw data.
-    unsafe fn from_data(data: usize) -> Self {
+    /// Returns a new atomic pointer initialized with the tagged pointer `data`.
+    fn from_data(data: usize) -> Self {
         Atomic {
             data: AtomicUsize::new(data),
             _marker: PhantomData,
         }
     }
 
-    /// Returns a new, null atomic pointer tagged with `tag`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of an aligned pointer.
-    pub fn null(tag: usize) -> Self {
-        unsafe { Self::from_raw(ptr::null_mut(), tag) }
+    pub fn fetch_and<'scope>(&self, val: usize, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+        // validate_tag::<T>(val);
+        Ptr::from_data(self.data.fetch_and(val, ord))
+    }
+    pub fn fetch_or<'scope>(&self, val: usize, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+        // validate_tag::<T>(val);
+        Ptr::from_data(self.data.fetch_or(val, ord))
     }
 
-    /// Allocates `data` on the heap and returns a new atomic pointer that points to it and is
-    /// tagged with `tag`.
+    /// Returns a new null atomic pointer.
     ///
-    /// # Panics
+    /// # Examples
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the allocated
-    /// pointer is unaligned.
-    pub fn new(data: T, tag: usize) -> Self {
-        unsafe { Self::from_raw(Box::into_raw(Box::new(data)), tag) }
+    /// ```
+    /// use coco::epoch::Atomic;
+    ///
+    /// let a = Atomic::<i32>::null();
+    /// ```
+    pub fn null() -> Self {
+        Atomic {
+            data: AtomicUsize::new(0),
+            _marker: PhantomData,
+        }
     }
 
-    /// Returns a new atomic pointer initialized with `ptr`.
+    /// Allocates `value` on the heap and returns a new atomic pointer pointing to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Atomic;
+    ///
+    /// let a = Atomic::new(1234);
+    /// ```
+    pub fn new(value: T) -> Self {
+        Self::from_owned(Owned::new(value))
+    }
+
+    /// Returns a new atomic pointer pointing to `owned`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{Atomic, Owned};
+    ///
+    /// let a = Atomic::from_owned(Owned::new(1234));
+    /// ```
+    pub fn from_owned(owned: Owned<T>) -> Self {
+        let data = owned.data;
+        mem::forget(owned);
+        Self::from_data(data)
+    }
+
+    /// Returns a new atomic pointer pointing to `ptr`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{Atomic, Ptr};
+    ///
+    /// let a = Atomic::from_ptr(Ptr::<i32>::null());
+    /// ```
     pub fn from_ptr(ptr: Ptr<T>) -> Self {
-        unsafe { Self::from_data(ptr.data) }
+        Self::from_data(ptr.data)
     }
 
-    /// Returns a new atomic pointer initialized with `b` and `tag`.
+    /// Loads a `Ptr` from the atomic pointer.
     ///
-    /// # Panics
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn from_box(b: Box<T>, tag: usize) -> Self {
-        unsafe { Self::from_raw(Box::into_raw(b), tag) }
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// epoch::pin(|scope| {
+    ///     let p = a.load(SeqCst, scope);
+    /// });
+    /// ```
+    pub fn load<'scope>(&self, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+        Ptr::from_data(self.data.load(ord))
     }
 
-    /// Returns a new atomic pointer initialized with `raw` and `tag`.
+    /// Stores a `Ptr` into the atomic pointer.
     ///
-    /// # Panics
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub unsafe fn from_raw(raw: *mut T, tag: usize) -> Self {
-        Self::from_data(raw_and_tag(raw, tag))
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Ptr};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// a.store(Ptr::null(), SeqCst);
+    /// ```
+    pub fn store(&self, new: Ptr<T>, ord: Ordering) {
+        self.data.store(new.data, ord);
     }
 
-    /// Loads the tagged atomic pointer.
+    /// Stores an `Owned` into the atomic pointer.
     ///
-    /// This operation uses the `Acquire` ordering.
-    pub fn load<'p>(&self, _: &'p Pin) -> Ptr<'p, T> {
-        unsafe { Ptr::from_data(self.data.load(Acquire)) }
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
+    ///
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::null();
+    /// a.store_owned(Owned::new(1234), SeqCst);
+    /// ```
+    pub fn store_owned(&self, new: Owned<T>, ord: Ordering) {
+        let data = new.data;
+        mem::forget(new);
+        self.data.store(data, ord);
     }
 
-    /// Loads the tagged atomic pointer as a raw pointer and a tag.
+    /// Stores a `Ptr` into the atomic pointer, returning the previous `Ptr`.
     ///
-    /// Argument `order` describes the memory ordering of this operation.
-    pub fn load_raw(&self, order: Ordering) -> (*mut T, usize) {
-        let p = unsafe { Ptr::<T>::from_data(self.data.load(order)) };
-        (p.as_raw(), p.tag())
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
+    ///
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned, Ptr};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// epoch::pin(|scope| {
+    ///     let p = a.swap(Ptr::null(), SeqCst, scope);
+    /// });
+    /// ```
+    pub fn swap<'scope>(&self, new: Ptr<T>, ord: Ordering, _: &'scope Scope) -> Ptr<'scope, T> {
+        Ptr::from_data(self.data.swap(new.data, ord))
     }
 
-    /// Stores `new` tagged with `tag` into the atomic.
+    /// Stores `new` into the atomic pointer if the current value is the same as `current`.
     ///
-    /// This operation uses the `Release` ordering.
-    pub fn store<'p>(&self, new: Ptr<'p, T>) {
-        self.data.store(new.data, Release);
-    }
-
-    /// Stores `new` tagged with `tag` into the atomic and returns it.
+    /// The return value is a result indicating whether the new pointer was written. On failure the
+    /// actual current value is returned.
     ///
-    /// This operation uses the `Release` ordering.
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
     ///
-    /// # Panics
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn store_box<'p>(&self, new: Box<T>, tag: usize, _: &'p Pin) -> Ptr<'p, T> {
-        let ptr = unsafe { Ptr::from_raw(Box::into_raw(new), tag) };
-        self.data.store(ptr.data, Release);
-        ptr
-    }
-
-    /// Stores `new` tagged with `tag` into the atomic.
+    /// # Examples
     ///
-    /// Argument `order` describes the memory ordering of this operation.
+    /// ```
+    /// use coco::epoch::{self, Atomic, Ptr};
+    /// use std::sync::atomic::Ordering::SeqCst;
     ///
-    /// # Panics
+    /// let a = Atomic::new(1234);
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub unsafe fn store_raw<'p>(
+    /// epoch::pin(|scope| {
+    ///     let mut curr = a.load(SeqCst, scope);
+    ///     let res = a.compare_and_swap(curr, Ptr::null(), SeqCst, scope);
+    /// });
+    /// ```
+    pub fn compare_and_swap<'scope>(
         &self,
-        new: *mut T,
-        tag: usize,
-        order: Ordering,
-        _: &'p Pin,
-    ) -> Ptr<'p, T> {
-        let ptr = Ptr::from_raw(new, tag);
-        self.data.store(ptr.data, order);
-        ptr
-    }
-
-    /// Stores `new` into the atomic, returning the old tagged pointer.
-    ///
-    /// This operation uses the `AcqRel` ordering.
-    pub fn swap<'p>(&self, new: Ptr<'p, T>) -> Ptr<'p, T> {
-        unsafe { Ptr::from_data(self.data.swap(new.data, AcqRel)) }
-    }
-
-    /// Stores `new` tagged with `tag` into the atomic, returning the old tagged pointer.
-    ///
-    /// This operation uses the `AcqRel` ordering.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn swap_box<'p>(&self, new: Box<T>, tag: usize, _: &'p Pin) -> Ptr<'p, T> {
-        let data = unsafe { Ptr::from_raw(Box::into_raw(new), tag).data };
-        unsafe { Ptr::from_data(self.data.swap(data, AcqRel)) }
-    }
-
-    /// Stores `new` tagged with `tag` into the atomic, returning the old tagged pointer.
-    ///
-    /// Argument `order` describes the memory ordering of this operation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub unsafe fn swap_raw<'p>(&self, new: *mut T, tag: usize, order: Ordering) -> Ptr<'p, T> {
-        let data = Ptr::from_raw(new, tag).data;
-        Ptr::from_data(self.data.swap(data, order))
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On failure the
-    /// current value of the tagged atomic pointer is returned.
-    ///
-    /// This operation uses the `AcqRel` ordering.
-    pub fn cas<'p>(
-        &self,
-        current: Ptr<'p, T>,
-        new: Ptr<'p, T>,
-    ) -> Result<(), Ptr<'p, T>> {
-        let previous = self.data.compare_and_swap(current.data, new.data, AcqRel);
-        if previous == current.data {
-            Ok(())
-        } else {
-            unsafe { Err(Ptr::from_data(previous)) }
-        }
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On failure the
-    /// current value of the tagged atomic pointer is returned.
-    ///
-    /// This operation uses the `SeqCst` ordering.
-    pub fn cas_sc<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
-        let previous = self.data.compare_and_swap(current.data, new.data, SeqCst);
-        if previous == current.data {
-            Ok(())
-        } else {
-            unsafe { Err(Ptr::from_data(previous)) }
-        }
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On failure the
-    /// current value of the tagged atomic pointer is returned.
-    ///
-    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
-    /// in more efficient code on some platforms.
-    ///
-    /// This operation uses the `AcqRel` ordering.
-    pub fn cas_weak<'p>(&self, current: Ptr<'p, T>, new: Ptr<'p, T>) -> Result<(), Ptr<'p, T>> {
-        match self.data.compare_exchange_weak(current.data, new.data, AcqRel, Acquire) {
+        current: Ptr<T>,
+        new: Ptr<T>,
+        ord: Ordering,
+        _: &'scope Scope,
+    ) -> Result<(), Ptr<'scope, T>> {
+        let fail_ord = strongest_failure_ordering(ord);
+        match self.data.compare_exchange(current.data, new.data, ord, fail_ord) {
             Ok(_) => Ok(()),
-            Err(previous) => unsafe { Err(Ptr::from_data(previous)) },
+            Err(previous) => Err(Ptr::from_data(previous)),
         }
     }
 
-    /// If the tagged atomic pointer is equal to `current`, stores `new`.
+    /// Stores `new` into the atomic pointer if the current value is the same as `current`.
     ///
-    /// The return value is a result indicating whether the new pointer was stored. On failure the
-    /// current value of the tagged atomic pointer is returned.
+    /// Unlike [`compare_and_swap`], this method is allowed to spuriously fail even when
+    /// comparison succeeds, which can result in more efficient code on some platforms.
+    /// The return value is a result indicating whether the new pointer was written. On failure the
+    /// actual current value is returned.
     ///
-    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
-    /// in more efficient code on some platforms.
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
     ///
-    /// This operation uses the `SeqCst` ordering.
-    pub fn cas_weak_sc<'p>(
+    /// [`compare_and_swap`]: struct.Atomic.html#method.compare_and_swap
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Ptr};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    ///
+    /// epoch::pin(|scope| {
+    ///     let mut curr = a.load(SeqCst, scope);
+    ///     loop {
+    ///         match a.compare_and_swap_weak(curr, Ptr::null(), SeqCst, scope) {
+    ///             Ok(()) => break,
+    ///             Err(c) => curr = c,
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    pub fn compare_and_swap_weak<'scope>(
         &self,
-        current: Ptr<'p, T>,
-        new: Ptr<'p, T>,
-    ) -> Result<(), Ptr<'p, T>> {
-        match self.data.compare_exchange_weak(current.data, new.data, SeqCst, SeqCst) {
+        current: Ptr<T>,
+        new: Ptr<T>,
+        ord: Ordering,
+        _: &'scope Scope,
+    ) -> Result<(), Ptr<'scope, T>> {
+        let fail_ord = strongest_failure_ordering(ord);
+        match self.data.compare_exchange_weak(current.data, new.data, ord, fail_ord) {
             Ok(_) => Ok(()),
-            Err(previous) => unsafe { Err(Ptr::from_data(previous)) },
+            Err(previous) => Err(Ptr::from_data(previous)),
         }
     }
 
-    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
+    /// Stores `new` into the atomic pointer if the current value is the same as `current`.
     ///
-    /// The return value is a result indicating whether the new pointer was stored. On success the
-    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
-    /// `new` are returned.
+    /// The return value is a result indicating whether the new pointer was written. On success the
+    /// pointer that was written is returned. On failure `new` and the actual current value are
+    /// returned.
     ///
-    /// This operation uses the `AcqRel` ordering.
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
     ///
-    /// # Panics
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn cas_box<'p>(
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    ///
+    /// epoch::pin(|scope| {
+    ///     let mut curr = a.load(SeqCst, scope);
+    ///     let res = a.compare_and_swap_owned(curr, Owned::new(5678), SeqCst, scope);
+    /// });
+    /// ```
+    pub fn compare_and_swap_owned<'scope>(
         &self,
-        current: Ptr<'p, T>,
-        mut new: Box<T>,
-        tag: usize,
-    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
-        let new_data = raw_and_tag(new.as_mut(), tag);
-        let previous = self.data.compare_and_swap(current.data, new_data, AcqRel);
-        if previous == current.data {
-            mem::forget(new);
-            unsafe { Ok(Ptr::from_data(new_data)) }
-        } else {
-            unsafe { Err((Ptr::from_data(previous), new)) }
-        }
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On success the
-    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
-    /// `new` are returned.
-    ///
-    /// This operation uses the `SeqCst` ordering.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn cas_box_sc<'p>(
-        &self,
-        current: Ptr<'p, T>,
-        mut new: Box<T>,
-        tag: usize,
-    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
-        let new_data = raw_and_tag(new.as_mut(), tag);
-        let previous = self.data.compare_and_swap(current.data, new_data, SeqCst);
-        if previous == current.data {
-            mem::forget(new);
-            unsafe { Ok(Ptr::from_data(new_data)) }
-        } else {
-            unsafe { Err((Ptr::from_data(previous), new)) }
-        }
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On success the
-    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
-    /// `new` are returned.
-    ///
-    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
-    /// in more efficient code on some platforms.
-    ///
-    /// This operation uses the `AcqRel` ordering.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn cas_box_weak<'p>(
-        &self,
-        current: Ptr<'p, T>,
-        mut new: Box<T>,
-        tag: usize
-    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
-        let new_data = raw_and_tag(new.as_mut(), tag);
-        match self.data.compare_exchange_weak(current.data, new_data, AcqRel, Acquire) {
+        current: Ptr<T>,
+        new: Owned<T>,
+        ord: Ordering,
+        _: &'scope Scope,
+    ) -> Result<Ptr<'scope, T>, (Ptr<'scope, T>, Owned<T>)> {
+        let fail_ord = strongest_failure_ordering(ord);
+        match self.data.compare_exchange(current.data, new.data, ord, fail_ord) {
             Ok(_) => {
+                let data = new.data;
                 mem::forget(new);
-                unsafe { Ok(Ptr::from_data(new_data)) }
+                Ok(Ptr::from_data(data))
             }
-            Err(previous) => unsafe { Err((Ptr::from_data(previous), new)) },
+            Err(previous) => Err((Ptr::from_data(previous), new)),
         }
     }
 
-    /// If the tagged atomic pointer is equal to `current`, stores `new` tagged with `tag`.
+    /// Stores `new` into the atomic pointer if the current value is the same as `current`.
     ///
-    /// The return value is a result indicating whether the new pointer was stored. On success the
-    /// new pointer is returned. On failure the current value of the tagged atomic pointer and
-    /// `new` are returned.
+    /// Unlike [`compare_and_swap_owned`], this method is allowed to spuriously fail even when
+    /// comparison succeeds, which can result in more efficient code on some platforms.
+    /// The return value is a result indicating whether the new pointer was written. On success the
+    /// pointer that was written is returned. On failure `new` and the actual current value are
+    /// returned.
     ///
-    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
-    /// in more efficient code on some platforms.
+    /// This method takes an [`Ordering`] argument which describes the memory ordering of this
+    /// operation.
     ///
-    /// This operation uses the `AcqRel` ordering.
+    /// [`compare_and_swap_owned`]: struct.Atomic.html#method.compare_and_swap_owned
+    /// [`Ordering`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html
     ///
-    /// # Panics
+    /// # Examples
     ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub fn cas_box_weak_sc<'p>(
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    ///
+    /// epoch::pin(|scope| {
+    ///     let mut new = Owned::new(5678);
+    ///     let mut ptr = a.load(SeqCst, scope);
+    ///     loop {
+    ///         match a.compare_and_swap_weak_owned(ptr, new, SeqCst, scope) {
+    ///             Ok(p) => {
+    ///                 ptr = p;
+    ///                 break;
+    ///             }
+    ///             Err((p, n)) => {
+    ///                 ptr = p;
+    ///                 new = n;
+    ///             }
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    pub fn compare_and_swap_weak_owned<'scope>(
         &self,
-        current: Ptr<'p, T>,
-        mut new: Box<T>,
-        tag: usize,
-    ) -> Result<Ptr<'p, T>, (Ptr<'p, T>, Box<T>)> {
-        let new_data = raw_and_tag(new.as_mut(), tag);
-        match self.data.compare_exchange_weak(current.data, new_data, SeqCst, SeqCst) {
+        current: Ptr<T>,
+        new: Owned<T>,
+        ord: Ordering,
+        _: &'scope Scope,
+    ) -> Result<Ptr<'scope, T>, (Ptr<'scope, T>, Owned<T>)> {
+        let fail_ord = strongest_failure_ordering(ord);
+        match self.data.compare_exchange_weak(current.data, new.data, ord, fail_ord) {
             Ok(_) => {
+                let data = new.data;
                 mem::forget(new);
-                unsafe { Ok(Ptr::from_data(new_data)) }
+                Ok(Ptr::from_data(data))
             }
-            Err(previous) => unsafe { Err((Ptr::from_data(previous), new)) },
-        }
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On failure the
-    /// current value of the tagged atomic pointer is returned.
-    ///
-    /// Argument `order` describes the memory ordering of this operation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub unsafe fn cas_raw(
-        &self,
-        current: (*mut T, usize),
-        new: (*mut T, usize),
-        order: Ordering,
-    ) -> Result<(), (*mut T, usize)> {
-        let current_data = raw_and_tag(current.0, current.1);
-        let new_data = raw_and_tag(new.0, new.1);
-        let previous = self.data.compare_and_swap(current_data, new_data, order);
-        if previous == current_data {
-            Ok(())
-        } else {
-            let ptr = Ptr::from_data(previous);
-            Err((ptr.as_raw(), ptr.tag()))
-        }
-    }
-
-    /// If the tagged atomic pointer is equal to `current`, stores `new`.
-    ///
-    /// The return value is a result indicating whether the new pointer was stored. On failure the
-    /// current value of the tagged atomic pointer is returned.
-    ///
-    /// This method can sometimes spuriously fail even when comparison succeeds, which can result
-    /// in more efficient code on some platforms.
-    ///
-    /// Argument `order` describes the memory ordering of this operation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub unsafe fn cas_raw_weak(
-        &self,
-        current: (*mut T, usize),
-        new: (*mut T, usize),
-        order: Ordering,
-    ) -> Result<(), (*mut T, usize)> {
-        let current_data = raw_and_tag(current.0, current.1);
-        let new_data = raw_and_tag(new.0, new.1);
-        let previous = self.data.compare_and_swap(current_data, new_data, order);
-        if previous == current_data {
-            Ok(())
-        } else {
-            let ptr = Ptr::from_data(previous);
-            Err((ptr.as_raw(), ptr.tag()))
+            Err(previous) => Err((Ptr::from_data(previous), new)),
         }
     }
 }
 
 impl<T> Default for Atomic<T> {
     fn default() -> Self {
-        Atomic {
-            data: AtomicUsize::new(0),
-            _marker: PhantomData,
-        }
+        Atomic::null()
     }
 }
 
-/// A tagged nullable pointer.
+/// An owned heap-allocated object.
+///
+/// This type is very similar to `Box<T>`.
+///
+/// The pointer must be properly aligned. Since it is aligned, a tag can be stored into the unused
+/// least significant bits of the address.
 #[derive(Debug)]
-pub struct Ptr<'p, T: 'p> {
+pub struct Owned<T> {
     data: usize,
-    _marker: PhantomData<(*mut T, &'p T)>, // !Send + !Sync
+    _marker: PhantomData<Box<T>>,
 }
 
-impl<'a, T> Clone for Ptr<'a, T> {
+impl<T> Owned<T> {
+    /// Returns a new owned pointer initialized with the tagged pointer `data`.
+    fn from_data(data: usize) -> Self {
+        Owned {
+            data: data,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Allocates `value` on the heap and returns a new owned pointer pointing to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Owned;
+    ///
+    /// let o = Owned::new(1234);
+    /// ```
+    pub fn new(value: T) -> Self {
+        Self::from_box(Box::new(value))
+    }
+
+    /// Returns a new owned pointer initialized with `b`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pointer (the `Box`) is not properly aligned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Owned;
+    ///
+    /// let o = unsafe { Owned::from_raw(Box::into_raw(Box::new(1234))) };
+    /// ```
+    pub fn from_box(b: Box<T>) -> Self {
+        unsafe { Self::from_raw(Box::into_raw(b)) }
+    }
+
+    /// Returns a new owned pointer initialized with `raw`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is not properly aligned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Owned;
+    ///
+    /// let o = unsafe { Owned::from_raw(Box::into_raw(Box::new(1234))) };
+    /// ```
+    pub unsafe fn from_raw(raw: *mut T) -> Self {
+        ensure_aligned(raw);
+        Self::from_data(raw as usize)
+    }
+
+    /// Converts the owned pointer to a [`Ptr`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Owned};
+    ///
+    /// let o = Owned::new(1234);
+    /// epoch::pin(|scope| {
+    ///     let p = o.into_ptr(scope);
+    /// });
+    /// ```
+    ///
+    /// [`Ptr`]: struct.Ptr.html
+    pub fn into_ptr<'scope>(self, _: &'scope Scope) -> Ptr<'scope, T> {
+        let data = self.data;
+        mem::forget(self);
+        Ptr::from_data(data)
+    }
+
+    /// Returns the tag stored within the pointer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Owned;
+    ///
+    /// assert_eq!(Owned::new(1234).tag(), 0);
+    /// ```
+    pub fn tag(&self) -> usize {
+        self.data & low_bits::<T>()
+    }
+
+    /// Returns the same pointer, but tagged with `tag`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Owned;
+    ///
+    /// let o = Owned::new(0u64);
+    /// assert_eq!(o.tag(), 0);
+    /// let o = o.with_tag(5);
+    /// assert_eq!(o.tag(), 5);
+    /// ```
+    pub fn with_tag(self, tag: usize) -> Self {
+        let data = self.data;
+        mem::forget(self);
+        Self::from_data(data_with_tag::<T>(data, tag))
+    }
+}
+
+impl<T> Deref for Owned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*((self.data & !low_bits::<T>()) as *const T) }
+    }
+}
+
+impl<T> DerefMut for Owned<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *((self.data & !low_bits::<T>()) as *mut T) }
+    }
+}
+
+/// A pointer to an object protected by the epoch GC.
+///
+/// The pointer is valid for use only within `'scope`.
+///
+/// The pointer must be properly aligned. Since it is aligned, a tag can be stored into the unused
+/// least significant bits of the address.
+#[derive(Debug)]
+pub struct Ptr<'scope, T: 'scope> {
+    data: usize,
+    _marker: PhantomData<&'scope T>,
+}
+
+impl<'scope, T> Clone for Ptr<'scope, T> {
     fn clone(&self) -> Self {
         Ptr {
             data: self.data,
@@ -453,80 +576,217 @@ impl<'a, T> Clone for Ptr<'a, T> {
     }
 }
 
-impl<'a, T> Copy for Ptr<'a, T> {}
+impl<'scope, T> Copy for Ptr<'scope, T> {}
 
-impl<'p, T: 'p> Ptr<'p, T> {
-    /// Constructs a nullable pointer from raw data.
-    unsafe fn from_data(data: usize) -> Self {
+impl<'scope, T> Ptr<'scope, T> {
+    /// Returns a new pointer initialized with the tagged pointer `data`.
+    fn from_data(data: usize) -> Self {
         Ptr {
             data: data,
             _marker: PhantomData,
         }
     }
 
-    /// Returns a null pointer with a tag.
+    /// Returns a new null pointer.
     ///
-    /// # Panics
+    /// # Examples
     ///
-    /// Panics if the tag doesn't fit into the unused bits of an aligned pointer.
-    pub fn null(tag: usize) -> Self {
-        unsafe { Self::from_data(raw_and_tag::<T>(ptr::null_mut(), tag)) }
-    }
-
-    /// Constructs a tagged pointer from a raw pointer and tag.
+    /// ```
+    /// use coco::epoch::Ptr;
     ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer, or if the pointer is
-    /// unaligned.
-    pub unsafe fn from_raw(raw: *mut T, tag: usize) -> Self {
-        Self::from_data(raw_and_tag(raw, tag))
-    }
-
-    /// Returns `true` if the pointer is null.
-    pub fn is_null(&self) -> bool {
-        self.as_raw().is_null()
-    }
-
-    /// Converts the pointer to a reference.
-    pub fn as_ref(&self) -> Option<&'p T> {
-        unsafe { self.as_raw().as_ref() }
-    }
-
-    /// Converts the pointer to a raw pointer.
-    pub fn as_raw(&self) -> *mut T {
-        (self.data & !low_bits::<T>()) as *mut T
-    }
-
-    /// Returns a reference to the pointing object.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pointer is null.
-    pub fn unwrap(&self) -> &'p T {
-        self.as_ref().unwrap()
-    }
-
-    /// Returns the tag.
-    pub fn tag(&self) -> usize {
-        self.data & low_bits::<T>()
-    }
-
-    /// Constructs a new tagged pointer with a different tag.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the tag doesn't fit into the unused bits of the pointer.
-    pub fn with_tag(&self, tag: usize) -> Self {
-        unsafe { Self::from_raw(self.as_raw(), tag) }
-    }
-}
-
-impl<'p, T> Default for Ptr<'p, T> {
-    fn default() -> Self {
+    /// let p = Ptr::<i32>::null();
+    /// assert!(p.is_null());
+    /// ```
+    pub fn null() -> Self {
         Ptr {
             data: 0,
             _marker: PhantomData,
         }
+    }
+
+    /// Returns a new pointer initialized with `raw`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is not properly aligned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::Ptr;
+    ///
+    /// let p = unsafe { Ptr::from_raw(Box::into_raw(Box::new(1234))) };
+    /// assert!(!p.is_null());
+    /// ```
+    pub unsafe fn from_raw(raw: *const T) -> Self {
+        ensure_aligned(raw);
+        Ptr {
+            data: raw as usize,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns `true` if the pointer is null.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::null();
+    /// epoch::pin(|scope| {
+    ///     assert!(a.load(SeqCst, scope).is_null());
+    ///     a.store_owned(Owned::new(1234), SeqCst);
+    ///     assert!(!a.load(SeqCst, scope).is_null());
+    /// });
+    /// ```
+    pub fn is_null(&self) -> bool {
+        self.as_raw().is_null()
+    }
+
+    /// Converts the pointer to a raw pointer (without the tag).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let o = Owned::new(1234);
+    /// let raw = &*o as *const _;
+    /// let a = Atomic::from_owned(o);
+    ///
+    /// epoch::pin(|scope| {
+    ///     let p = a.load(SeqCst, scope);
+    ///     assert_eq!(p.as_raw(), raw);
+    /// });
+    /// ```
+    pub fn as_raw(&self) -> *const T {
+        (self.data & !low_bits::<T>()) as *const T
+    }
+
+    /// Dereferences the pointer.
+    ///
+    /// Returns a reference to the pointee that is valid in `'scope`.
+    ///
+    /// # Safety
+    ///
+    /// Dereferencing a pointer to an invalid object is not a concern, since invalid `Ptr`s
+    /// can only be constructed via other unsafe functions.
+    ///
+    /// However, this method doesn't check whether the pointer is null, so dereferencing a null
+    /// pointer is unsafe.
+    ///
+    /// Another source of unsafety is the possibility of unsynchronized reads to the objects.
+    /// For example, the following scenario is unsafe:
+    ///
+    /// * A thread stores a new object: `a.store_owned(Owned::new(10), Relaxed)`
+    /// * Another thread reads it: `*a.load(Relaxed, scope).as_ref().unwrap()`
+    ///
+    /// The problem is that relaxed orderings don't synchronize initialization of the object with
+    /// the read from the second thread. This is a data race. A possible solution would be to use
+    /// `Release` and `Acquire` orderings (or stronger).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// epoch::pin(|scope| {
+    ///     let p = a.load(SeqCst, scope);
+    ///     unsafe {
+    ///         assert_eq!(p.deref(), &1234);
+    ///     }
+    /// });
+    /// ```
+    pub unsafe fn deref(&self) -> &'scope T {
+        &*self.as_raw()
+    }
+
+    /// Converts the pointer to a reference.
+    ///
+    /// Returns `None` if the pointer is null, or else a reference to the object wrapped in `Some`.
+    ///
+    /// # Safety
+    ///
+    /// This method checks whether the pointer is null, and if not, assumes that it's pointing to a
+    /// valid object. However, this is not considered a source of unsafety because invalid `Ptr`s
+    /// can only be constructed via other unsafe functions.
+    ///
+    /// The only source of unsafety is the possibility of unsynchronized reads to the objects.
+    /// For example, the following scenario is unsafe:
+    ///
+    /// * A thread stores a new object: `a.store_owned(Owned::new(10), Relaxed)`
+    /// * Another thread reads it: `*a.load(Relaxed, scope).as_ref().unwrap()`
+    ///
+    /// The problem is that relaxed orderings don't synchronize initialization of the object with
+    /// the read from the second thread. This is a data race. A possible solution would be to use
+    /// `Release` and `Acquire` orderings (or stronger).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(1234);
+    /// epoch::pin(|scope| {
+    ///     let p = a.load(SeqCst, scope);
+    ///     unsafe {
+    ///         assert_eq!(p.as_ref(), Some(&1234));
+    ///     }
+    /// });
+    /// ```
+    pub unsafe fn as_ref(&self) -> Option<&'scope T> {
+        self.as_raw().as_ref()
+    }
+
+    /// Returns the tag stored within the pointer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic, Owned};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::from_owned(Owned::new(0u64).with_tag(5));
+    /// epoch::pin(|scope| {
+    ///     let p = a.load(SeqCst, scope);
+    ///     assert_eq!(p.tag(), 5);
+    /// });
+    /// ```
+    pub fn tag(&self) -> usize {
+        self.data & low_bits::<T>()
+    }
+
+    /// Returns the same pointer, but tagged with `tag`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::epoch::{self, Atomic};
+    /// use std::sync::atomic::Ordering::SeqCst;
+    ///
+    /// let a = Atomic::new(0u64);
+    /// epoch::pin(|scope| {
+    ///     let p1 = a.load(SeqCst, scope);
+    ///     let p2 = p1.with_tag(5);
+    ///
+    ///     assert_eq!(p1.tag(), 0);
+    ///     assert_eq!(p2.tag(), 5);
+    ///     assert_eq!(p1.as_raw(), p2.as_raw());
+    /// });
+    /// ```
+    pub fn with_tag(&self, tag: usize) -> Self {
+        Self::from_data(data_with_tag::<T>(self.data, tag))
+    }
+}
+
+impl<'scope, T> Default for Ptr<'scope, T> {
+    fn default() -> Self {
+        Ptr::null()
     }
 }
