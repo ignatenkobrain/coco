@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, fence};
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
 
-use epoch::{self, Atomic};
+use epoch::{self, Atomic, Owned};
 
 /// Minimum buffer capacity for a deque.
 const MIN_CAP: usize = 16;
@@ -104,6 +104,14 @@ impl<T> Buffer<T> {
     }
 }
 
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        unsafe {
+            drop(Vec::from_raw_parts(self.ptr, 0, self.cap));
+        }
+    }
+}
+
 struct Deque<T> {
     bottom: AtomicIsize,
     top: AtomicIsize,
@@ -117,7 +125,7 @@ impl<T> Deque<T> {
         Deque {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
-            buffer: Atomic::new(Buffer::new(MIN_CAP), 0),
+            buffer: Atomic::new(Buffer::new(MIN_CAP)),
         }
     }
 
@@ -137,7 +145,8 @@ impl<T> Deque<T> {
         // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        let buffer = self.buffer.load_raw(Relaxed).0;
+
+        let buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
 
         // Allocate a new buffer.
         let new = Buffer::new(new_cap);
@@ -149,21 +158,17 @@ impl<T> Deque<T> {
             i = i.wrapping_add(1);
         }
 
-        epoch::pin(|pin| {
+        epoch::pin(|scope| {
             // Replace the old buffer with the new one.
-            self.buffer.store_box(Box::new(new), 0, pin).as_raw();
-
-            let ptr = (*buffer).ptr;
-            let cap = (*buffer).cap;
+            let old = self.buffer.swap(Owned::new(new).into_ptr(scope), Release, scope);
 
             // Destroy the old buffer later.
-            epoch::defer_free(ptr, cap, pin);
-            epoch::defer_free(buffer, 1, pin);
+            scope.defer_drop(old);
 
-            // If the size of the buffer at least than 1KB, then flush the thread-local garbage in
+            // If the size of the buffer at least 1KB, then flush the thread-local garbage in
             // order to destroy it sooner.
-            if mem::size_of::<T>() * cap >= 1 << 10 {
-                epoch::flush(pin);
+            if mem::size_of::<T>() * new_cap >= 1 << 10 {
+                scope.flush();
             }
         })
     }
@@ -175,7 +180,8 @@ impl<T> Deque<T> {
             // because the current thread (the worker) is the only one that grows and shrinks it.
             let b = self.bottom.load(Relaxed);
             let t = self.top.load(Acquire);
-            let mut buffer = self.buffer.load_raw(Relaxed).0;
+
+            let mut buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
 
             // Calculate the length of the deque.
             let len = b.wrapping_sub(t);
@@ -185,7 +191,7 @@ impl<T> Deque<T> {
             if len >= cap as isize {
                 // Yes. Grow the underlying buffer.
                 self.resize(2 * cap);
-                buffer = self.buffer.load_raw(Relaxed).0;
+                buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
             }
 
             // Write `value` into the right slot and increment `b`.
@@ -212,7 +218,7 @@ impl<T> Deque<T> {
 
         // Load the buffer. The buffer doesn't have to be epoch-protected because the current
         // thread (the worker) is the only one that grows and shrinks it.
-        let buffer = self.buffer.load_raw(Relaxed).0;
+        let a = unsafe { epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw()) };
 
         fence(SeqCst);
 
@@ -228,7 +234,7 @@ impl<T> Deque<T> {
             None
         } else {
             // Read the value to be popped.
-            let mut value = unsafe { Some((*buffer).read(b)) };
+            let mut value = unsafe { Some((*a).read(b)) };
 
             // Are we popping the last element from the deque?
             if len == 0 {
@@ -243,7 +249,7 @@ impl<T> Deque<T> {
             } else {
                 // Shrink the buffer if `len` is less than one fourth of `cap`.
                 unsafe {
-                    let cap = (*buffer).cap;
+                    let cap = (*a).cap;
                     if cap > MIN_CAP && len < cap as isize / 4 {
                         self.resize(cap / 2);
                     }
@@ -266,7 +272,7 @@ impl<T> Deque<T> {
             fence(SeqCst);
         }
 
-        epoch::pin(|pin| {
+        epoch::pin(|scope| {
             // Loop until we successfully steal an element or find the deque empty.
             loop {
                 // Load the bottom.
@@ -278,8 +284,8 @@ impl<T> Deque<T> {
                 }
 
                 // Load the buffer and read the value at the top.
-                let a = self.buffer.load(pin).unwrap();
-                let value = unsafe { a.read(t) };
+                let a = self.buffer.load(Acquire, scope);
+                let value = unsafe { a.deref().read(t) };
 
                 // Try incrementing the top to steal the value.
                 if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
@@ -300,7 +306,7 @@ impl<T> Deque<T> {
     /// Steals an element from the top of the deque, but only the worker may call this method.
     fn steal_as_worker(&self) -> Option<T> {
         let b = self.bottom.load(Relaxed);
-        let a = self.buffer.load_raw(Relaxed).0;
+        let a = unsafe { epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw()) };
 
         // Loop until we successfully steal an element or find the deque empty.
         loop {
@@ -324,9 +330,10 @@ impl<T> Drop for Deque<T> {
         // Load the bottom, top, and buffer.
         let b = self.bottom.load(Relaxed);
         let t = self.top.load(Relaxed);
-        let buffer = self.buffer.load_raw(Relaxed).0;
 
         unsafe {
+            let buffer = epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw());
+
             // Go through the buffer from top to bottom and drop all elements in the deque.
             let mut i = t;
             while i != b {
@@ -335,8 +342,7 @@ impl<T> Drop for Deque<T> {
             }
 
             // Free the memory allocated by the buffer.
-            drop(Vec::from_raw_parts((*buffer).ptr, 0, (*buffer).cap));
-            drop(Vec::from_raw_parts(buffer, 0, 1));
+            drop(Box::from_raw(buffer as *mut Buffer<T>));
         }
     }
 }

@@ -53,6 +53,8 @@
 //! [`Stack`]: stack/struct.Stack.html
 //! [`deque`]: deque/fn.new.html
 
+#![cfg_attr(feature = "nightly", feature(const_fn))]
+
 extern crate either;
 
 #[macro_use(defer)]

@@ -21,20 +21,21 @@
 //!
 //! There is a global shared instance of [`Garbage`], which can only deallocate memory. It cannot
 //! drop objects or run arbitrary destruction procedures. Removed objects can be stored into it by
-//! calling [`defer_free`].
+//! calling [`defer_free`] or [`defer_drop`].
 //!
 //! [`Atomic`]: struct.Atomic.html
 //! [`Garbage`]: struct.Garbage.html
 //! [`Ptr`]: struct.Ptr.html
-//! [`defer_free`]: fn.defer_free.html
+//! [`defer_free`]: struct.Scope.html#method.defer_free
+//! [`defer_drop`]: struct.Scope.html#method.defer_drop
 
 mod atomic;
 mod garbage;
 mod thread;
 
-pub use self::atomic::{Atomic, Ptr};
+pub use self::atomic::{Atomic, Owned, Ptr};
 pub use self::garbage::Garbage;
-pub use self::thread::{Pin, defer_free, flush, is_pinned, pin};
+pub use self::thread::{Scope, is_pinned, pin, unprotected};
 
 #[cfg(feature = "internals")]
 pub use self::garbage::destroy_global;

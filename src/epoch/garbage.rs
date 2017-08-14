@@ -32,7 +32,7 @@ use std::mem;
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, SeqCst};
 
-use epoch::{self, Atomic, Pin, Ptr};
+use epoch::{self, Atomic, Owned, Scope, Ptr};
 
 /// Maximum number of objects a bag can contain.
 #[cfg(not(feature = "strict_gc"))]
@@ -69,7 +69,7 @@ impl Bag {
             len: AtomicUsize::new(0),
             objects: unsafe { mem::zeroed() },
             epoch: unsafe { mem::uninitialized() },
-            next: Atomic::null(0),
+            next: Atomic::null(),
         }
     }
 
@@ -79,11 +79,11 @@ impl Bag {
     }
 
     /// Attempts to insert a garbage object into the bag and returns `true` if succeeded.
-    pub fn try_insert<T>(&self, destroy: unsafe fn(*mut T, usize), object: *mut T, count: usize)
+    pub fn try_insert<T>(&self, destroy: unsafe fn(*mut T, usize), object: *const T, count: usize)
                          -> bool {
         // Erase type `*mut T` and use `*mut u8` instead.
         let destroy: unsafe fn(*mut u8, usize) = unsafe { mem::transmute(destroy) };
-        let object = object as *mut u8;
+        let object = object as *const u8 as *mut u8;
 
         let mut len = self.len.load(Acquire);
         loop {
@@ -144,19 +144,20 @@ impl Garbage {
     /// Returns a new, empty garbage queue.
     pub fn new() -> Self {
         let garbage = Garbage {
-            head: Atomic::null(0),
-            tail: Atomic::null(0),
-            pending: Atomic::null(0),
+            head: Atomic::null(),
+            tail: Atomic::null(),
+            pending: Atomic::null(),
         };
 
         // This code may be executing while a thread harness is initializing, so normal pinning
         // would try to access it while it is being initialized. Such accesses fail with a panic.
         // We must therefore cheat by creating a fake pin.
-        let pin = unsafe { &mem::zeroed::<Pin>() };
+        let pin = unsafe { &mem::zeroed::<Scope>() };
 
         // The head of the queue is always a sentinel entry.
-        let sentinel = garbage.head.store_box(Box::new(Bag::new()), 0, pin);
-        garbage.tail.store(sentinel);
+        let sentinel = Owned::new(Bag::new()).into_ptr(pin);
+        garbage.head.store(sentinel, Relaxed);
+        garbage.tail.store(sentinel, Relaxed);
 
         garbage
     }
@@ -166,24 +167,24 @@ impl Garbage {
     /// The return value is a result indicating whether the compare-and-swap successfully installed
     /// a new bag. On success the new bag is returned. On failure the current more up-to-date
     /// pending bag is returned.
-    fn replace_pending<'p>(&self, old: Ptr<'p, Bag>, pin: &'p Pin)
+    fn replace_pending<'p>(&self, old: Ptr<'p, Bag>, scope: &'p Scope)
                            -> Result<Ptr<'p, Bag>, Ptr<'p, Bag>> {
-        match self.pending.cas_box(old, Box::new(Bag::new()), 0) {
+        match self.pending.compare_and_swap_weak_owned(old, Owned::new(Bag::new()), AcqRel, scope) {
             Ok(new) => {
                 if !old.is_null() {
                     // Push the old bag into the queue.
-                    let bag = unsafe { Box::from_raw(old.as_raw()) };
-                    self.push(bag, pin);
+                    let bag = unsafe { Box::from_raw(old.as_raw() as *mut _) };
+                    self.push(bag, scope);
                 }
 
                 // Spare some cycles on garbage collection.
                 // Note: This may itself produce garbage and allocate new bags.
-                epoch::thread::try_advance(pin);
-                self.collect(pin);
+                epoch::thread::try_advance(scope);
+                self.collect(scope);
 
                 Ok(new)
             }
-            Err((pending, _)) => Err(pending),
+            Err((pending, _)) => Err(pending)
         }
     }
 
@@ -194,12 +195,12 @@ impl Garbage {
     ///
     /// This method inserts the object into the garbage buffer. When the buffers becomes full, it's
     /// objects are flushed into the garbage queue.
-    pub unsafe fn defer_free<T>(&self, object: *mut T, count: usize, pin: &Pin) {
+    pub unsafe fn defer_free<T>(&self, object: *const T, count: usize, scope: &Scope) {
         unsafe fn free<T>(ptr: *mut T, count: usize) {
             // Free the memory, but don't run the destructors.
             drop(Vec::from_raw_parts(ptr, 0, count));
         }
-        self.defer_destroy(free, object, count, pin);
+        self.defer_destroy(free, object, count, scope);
     }
 
     /// Adds an object that will later be dropped and freed.
@@ -211,12 +212,12 @@ impl Garbage {
     /// objects are flushed into the garbage queue.
     ///
     /// Note: The object must be `Send + 'self`.
-    pub unsafe fn defer_drop<T>(&self, object: *mut T, count: usize, pin: &Pin) {
+    pub unsafe fn defer_drop<T>(&self, object: *const T, count: usize, scope: &Scope) {
         unsafe fn destruct<T>(ptr: *mut T, count: usize) {
             // Run the destructors and free the memory.
             drop(Vec::from_raw_parts(ptr, count, count));
         }
-        self.defer_destroy(destruct, object, count, pin);
+        self.defer_destroy(destruct, object, count, scope);
     }
 
     /// Adds an object that will later be destroyed using `destroy`.
@@ -231,16 +232,16 @@ impl Garbage {
     pub unsafe fn defer_destroy<T>(
         &self,
         destroy: unsafe fn(*mut T, usize),
-        object: *mut T,
+        object: *const T,
         count: usize,
-        pin: &Pin
+        scope: &Scope
     ) {
-        let mut pending = self.pending.load(pin);
+        let mut pending = self.pending.load(Acquire, scope);
         loop {
             match pending.as_ref() {
                 Some(p) if p.try_insert(destroy, object, count) => break,
                 _ => {
-                    match self.replace_pending(pending, pin) {
+                    match self.replace_pending(pending, scope) {
                         Ok(p) => pending = p,
                         Err(p) => pending = p,
                     }
@@ -253,17 +254,17 @@ impl Garbage {
     ///
     /// It is wise to flush the garbage just after passing a very large object to one of the
     /// `defer_*` methods, so that it isn't sitting in the buffer for a long time.
-    pub fn flush(&self, pin: &Pin) {
-        let mut pending = self.pending.load(pin);
+    pub fn flush(&self, scope: &Scope) {
+        let mut pending = self.pending.load(Acquire, scope);
         loop {
-            match pending.as_ref() {
+            match unsafe { pending.as_ref() } {
                 None => break,
                 Some(p) => {
                     if p.is_empty() {
                         // The bag is already empty.
                         break;
                     } else {
-                        match self.replace_pending(pending, pin) {
+                        match self.replace_pending(pending, scope) {
                             Ok(_) => break,
                             Err(p) => pending = p,
                         }
@@ -280,7 +281,7 @@ impl Garbage {
     /// production, it might be a good idea to call this method from time to time.
     ///
     /// This method collects several buffers worth of garbage objects.
-    pub fn collect(&self, pin: &Pin) {
+    pub fn collect(&self, scope: &Scope) {
         /// Number of bags to destroy.
         const COLLECT_STEPS: usize = 8;
 
@@ -293,7 +294,7 @@ impl Garbage {
         };
 
         for _ in 0..COLLECT_STEPS {
-            match self.try_pop_if(&condition, pin) {
+            match self.try_pop_if(&condition, scope) {
                 None => break,
                 Some(bag) => unsafe { bag.destroy_all_objects() },
             }
@@ -301,19 +302,21 @@ impl Garbage {
     }
 
     /// Pushes a bag into the queue.
-    fn push(&self, mut bag: Box<Bag>, pin: &Pin) {
+    fn push(&self, mut bag: Box<Bag>, scope: &Scope) {
         // Mark the bag with the current epoch.
         bag.epoch = EPOCH.load(SeqCst);
+        let mut bag = Owned::from_box(bag);
 
-        let mut tail = self.tail.load(pin);
+        let mut tail = self.tail.load(Acquire, scope);
         loop {
-            let next = tail.unwrap().next.load(pin);
+            let next = unsafe { tail.deref().next.load(Acquire, scope) };
+
             if next.is_null() {
                 // Try installing the new bag.
-                match tail.unwrap().next.cas_box(next, bag, 0) {
-                    Ok(bag) => {
+                match unsafe { tail.deref() }.next.compare_and_swap_weak_owned(next, bag, AcqRel, scope) {
+                    Ok(b) => {
                         // Tail pointer shouldn't fall behind. Let's move it forward.
-                        let _ = self.tail.cas(tail, bag);
+                        let _ = self.tail.compare_and_swap(tail, b, AcqRel, scope);
                         break;
                     }
                     Err((t, b)) => {
@@ -323,7 +326,7 @@ impl Garbage {
                 }
             } else {
                 // This is not the actual tail. Move the tail pointer forward.
-                match self.tail.cas(tail, next) {
+                match self.tail.compare_and_swap_weak(tail, next, AcqRel, scope) {
                     Ok(()) => tail = next,
                     Err(t) => tail = t,
                 }
@@ -334,19 +337,21 @@ impl Garbage {
     /// Attempts to pop a bag from the front of the queue and returns it if `condition` is met.
     ///
     /// If the bag in the front doesn't meet it or if the queue is empty, `None` is returned.
-    fn try_pop_if<'p, F>(&self, condition: F, pin: &'p Pin) -> Option<&'p Bag>
+    fn try_pop_if<'p, F>(&self, condition: F, scope: &'p Scope) -> Option<&'p Bag>
         where F: Fn(&Bag) -> bool
     {
-        let mut head = self.head.load(pin);
+        let mut head = self.head.load(Acquire, scope);
+
         loop {
-            let next = head.unwrap().next.load(pin);
-            match next.as_ref() {
+            let next = unsafe { head.deref().next.load(Acquire, scope) };
+
+            match unsafe { next.as_ref() } {
                 Some(n) if condition(n) => {
                     // Try moving the head forward.
-                    match self.head.cas(head, next) {
+                    match self.head.compare_and_swap_weak(head, next, AcqRel, scope) {
                         Ok(()) => {
                             // The old head may be later freed.
-                            unsafe { epoch::defer_free(head.as_raw(), 1, pin) }
+                            unsafe { scope.defer_free(head) }
                             // The new head holds the popped value (heads are sentinels!).
                             return Some(n);
                         }
@@ -362,32 +367,34 @@ impl Garbage {
 impl Drop for Garbage {
     fn drop(&mut self) {
         unsafe {
-            // Load the pending bag, then destroy it and all it's objects.
-            let pending = self.pending.load_raw(Relaxed).0;
-            if !pending.is_null() {
-                (*pending).destroy_all_objects();
-                drop(Vec::from_raw_parts(pending, 0, 1));
-            }
-
-            // Destroy all bags and objects in the queue.
-            let mut head = self.head.load_raw(Relaxed).0;
-            loop {
-                // Load the next bag and destroy the current head.
-                let next = (*head).next.load_raw(Relaxed).0;
-                drop(Vec::from_raw_parts(head, 0, 1));
-
-                // If the next node is null, we've reached the end of the queue.
-                if next.is_null() {
-                    break;
+            epoch::unprotected(|scope| {
+                // Load the pending bag, then destroy it and all it's objects.
+                let pending = self.pending.load(Relaxed, scope).as_raw();
+                if !pending.is_null() {
+                    (*pending).destroy_all_objects();
+                    drop(Vec::from_raw_parts(pending as *mut Bag, 0, 1));
                 }
 
-                // Move one step forward.
-                head = next;
+                // Destroy all bags and objects in the queue.
+                let mut head = self.head.load(Relaxed, scope).as_raw();
+                loop {
+                    // Load the next bag and destroy the current head.
+                    let next = (*head).next.load(Relaxed, scope).as_raw();
+                    drop(Vec::from_raw_parts(head as *mut Bag, 0, 1));
 
-                // Destroy all objects in this bag.
-                // The bag itself will be destroyed in the next iteration of the loop.
-                (*head).destroy_all_objects();
-            }
+                    // If the next node is null, we've reached the end of the queue.
+                    if next.is_null() {
+                        break;
+                    }
+
+                    // Move one step forward.
+                    head = next;
+
+                    // Destroy all objects in this bag.
+                    // The bag itself will be destroyed in the next iteration of the loop.
+                    (*head).destroy_all_objects();
+                }
+            })
         }
     }
 }
@@ -426,13 +433,13 @@ fn global() -> &'static Garbage {
 }
 
 /// Pushes a bag into the global garbage.
-pub fn push(bag: Box<Bag>, pin: &Pin) {
-    global().push(bag, pin);
+pub fn push(bag: Box<Bag>, scope: &Scope) {
+    global().push(bag, scope);
 }
 
 /// Collects several bags from the global queue and destroys their objects.
-pub fn collect(pin: &Pin) {
-    global().collect(pin);
+pub fn collect(scope: &Scope) {
+    global().collect(scope);
 }
 
 /// Destroys the global garbage.
@@ -465,10 +472,10 @@ mod tests {
     #[test]
     fn smoke() {
         let g = Garbage::new();
-        epoch::pin(|pin| {
+        epoch::pin(|scope| unsafe {
             let a = Box::into_raw(Box::new(7));
-            unsafe { g.defer_free(a, 1, pin) }
-            assert!(!g.pending.load(pin).unwrap().is_empty());
+            g.defer_free(a, 1, scope);
+            assert!(!g.pending.load(SeqCst, scope).deref().is_empty());
         });
     }
 
@@ -478,13 +485,13 @@ mod tests {
         let mut rng = thread_rng();
 
         for _ in 0..100_000 {
-            epoch::pin(|pin| unsafe {
+            epoch::pin(|scope| unsafe {
                 let a = Box::into_raw(Box::new(7));
-                g.defer_drop(a, 1, pin);
+                g.defer_drop(a, 1, scope);
 
                 if rng.gen_range(0, 100) == 0 {
-                    g.flush(pin);
-                    assert!(g.pending.load(pin).unwrap().is_empty());
+                    g.flush(scope);
+                    assert!(g.pending.load(SeqCst, scope).deref().is_empty());
                 }
             });
         }
@@ -497,16 +504,16 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             for _ in 0..COUNT {
                 let a = Box::into_raw(Box::new(7i32));
                 unsafe fn destroy(ptr: *mut i32, count: usize) {
                     drop(Box::from_raw(ptr));
                     DESTROYS.fetch_add(count, SeqCst);
                 }
-                g.defer_destroy(destroy, a, 1, pin);
+                g.defer_destroy(destroy, a, 1, scope);
             }
-            g.flush(pin);
+            g.flush(scope);
         });
 
         let mut last = 0;
@@ -516,7 +523,7 @@ mod tests {
             assert!(curr - last < 1000);
             last = curr;
 
-            epoch::pin(|pin| g.collect(pin));
+            epoch::pin(|scope| g.collect(scope));
         }
         assert!(DESTROYS.load(SeqCst) == COUNT);
     }
@@ -528,27 +535,27 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             for _ in 0..COUNT {
                 let a = Box::into_raw(Box::new(7i32));
                 unsafe fn destroy(ptr: *mut i32, count: usize) {
                     drop(Box::from_raw(ptr));
                     DESTROYS.fetch_add(count, SeqCst);
                 }
-                g.defer_destroy(destroy, a, 1, pin);
+                g.defer_destroy(destroy, a, 1, scope);
             }
         });
 
         for _ in 0..100_000 {
-            epoch::pin(|pin| {
-                g.collect(pin);
+            epoch::pin(|scope| {
+                g.collect(scope);
                 assert!(DESTROYS.load(SeqCst) < COUNT);
             });
         }
-        epoch::pin(|pin| g.flush(pin));
+        epoch::pin(|scope| g.flush(scope));
 
         while DESTROYS.load(SeqCst) < COUNT {
-            epoch::pin(|pin| g.collect(pin));
+            epoch::pin(|scope| g.collect(scope));
         }
         assert_eq!(DESTROYS.load(SeqCst), COUNT);
     }
@@ -568,16 +575,16 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             for _ in 0..COUNT {
                 let a = Box::into_raw(Box::new(Elem(7i32)));
-                g.defer_drop(a, 1, pin);
+                g.defer_drop(a, 1, scope);
             }
-            g.flush(pin);
+            g.flush(scope);
         });
 
         while DROPS.load(SeqCst) < COUNT {
-            epoch::pin(|pin| g.collect(pin));
+            epoch::pin(|scope| g.collect(scope));
         }
         assert_eq!(DROPS.load(SeqCst), COUNT);
     }
@@ -589,20 +596,20 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             for _ in 0..COUNT {
                 let a = Box::into_raw(Box::new(7i32));
                 unsafe fn destroy(ptr: *mut i32, count: usize) {
                     drop(Box::from_raw(ptr));
                     DESTROYS.fetch_add(count, SeqCst);
                 }
-                g.defer_destroy(destroy, a, 1, pin);
+                g.defer_destroy(destroy, a, 1, scope);
             }
-            g.flush(pin);
+            g.flush(scope);
         });
 
         while DESTROYS.load(SeqCst) < COUNT {
-            epoch::pin(|pin| g.collect(pin));
+            epoch::pin(|scope| g.collect(scope));
         }
         assert_eq!(DESTROYS.load(SeqCst), COUNT);
     }
@@ -622,20 +629,20 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             let mut v = Vec::with_capacity(COUNT);
             for i in 0..COUNT {
                 v.push(Elem(i as i32));
             }
 
-            g.defer_drop(v.as_mut_ptr(), v.len(), pin);
-            g.flush(pin);
+            g.defer_drop(v.as_mut_ptr(), v.len(), scope);
+            g.flush(scope);
 
             mem::forget(v);
         });
 
         while DROPS.load(SeqCst) < COUNT {
-            epoch::pin(|pin| g.collect(pin));
+            epoch::pin(|scope| g.collect(scope));
         }
         assert_eq!(DROPS.load(SeqCst), COUNT);
     }
@@ -647,7 +654,7 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             let mut v = Vec::with_capacity(COUNT);
             for i in 0..COUNT {
                 v.push(i as i32);
@@ -658,14 +665,14 @@ mod tests {
                 drop(Vec::from_raw_parts(ptr, count, count));
                 DESTROYS.fetch_add(count, SeqCst);
             }
-            g.defer_destroy(destroy, v.as_mut_ptr(), v.len(), pin);
-            g.flush(pin);
+            g.defer_destroy(destroy, v.as_mut_ptr(), v.len(), scope);
+            g.flush(scope);
 
             mem::forget(v);
         });
 
         while DESTROYS.load(SeqCst) < COUNT {
-            epoch::pin(|pin| g.collect(pin));
+            epoch::pin(|scope| g.collect(scope));
         }
         assert_eq!(DESTROYS.load(SeqCst), COUNT);
     }
@@ -685,12 +692,12 @@ mod tests {
 
         let g = Garbage::new();
 
-        epoch::pin(|pin| unsafe {
+        epoch::pin(|scope| unsafe {
             for _ in 0..COUNT {
                 let a = Box::into_raw(Box::new(Elem(7i32)));
-                g.defer_drop(a, 1, pin);
+                g.defer_drop(a, 1, scope);
             }
-            g.flush(pin);
+            g.flush(scope);
         });
 
         drop(g);
@@ -718,9 +725,9 @@ mod tests {
 
             thread::spawn(move || {
                 for _ in 0..COUNT {
-                    epoch::pin(|pin| unsafe {
+                    epoch::pin(|scope| unsafe {
                         let a = Box::into_raw(Box::new(Elem(7i32)));
-                        g.defer_drop(a, 1, pin);
+                        g.defer_drop(a, 1, scope);
                     });
                 }
             })

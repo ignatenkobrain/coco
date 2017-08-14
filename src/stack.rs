@@ -3,9 +3,9 @@
 //! This is an implementation of the Treiber stack, one of the simplest lock-free data structures.
 
 use std::ptr;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 
-use epoch::{self, Atomic};
+use epoch::{self, Atomic, Owned};
 
 /// A single node in a stack.
 struct Node<T> {
@@ -36,7 +36,7 @@ impl<T> Stack<T> {
     /// let s = Stack::<i32>::new();
     /// ```
     pub fn new() -> Self {
-        Stack { head: Atomic::null(0) }
+        Stack { head: Atomic::null() }
     }
 
     /// Returns `true` if the stack is empty.
@@ -52,7 +52,7 @@ impl<T> Stack<T> {
     /// assert!(!s.is_empty());
     /// ```
     pub fn is_empty(&self) -> bool {
-        epoch::pin(|pin| self.head.load(pin).is_null())
+        epoch::pin(|scope| self.head.load(Acquire, scope).is_null())
     }
 
     /// Pushes a new value onto the stack.
@@ -67,16 +67,16 @@ impl<T> Stack<T> {
     /// s.push(2);
     /// ```
     pub fn push(&self, value: T) {
-        let mut node = Box::new(Node {
+        let mut node = Owned::new(Node {
             value: value,
-            next: Atomic::null(0),
+            next: Atomic::null(),
         });
 
-        epoch::pin(|pin| {
-            let mut head = self.head.load(pin);
+        epoch::pin(|scope| {
+            let mut head = self.head.load(Acquire, scope);
             loop {
-                node.next.store(head);
-                match self.head.cas_box(head, node, 0) {
+                node.next.store(head, Relaxed);
+                match self.head.compare_and_swap_weak_owned(head, node, AcqRel, scope) {
                     Ok(_) => break,
                     Err((h, n)) => {
                         head = h;
@@ -104,15 +104,15 @@ impl<T> Stack<T> {
     /// assert_eq!(s.pop(), None);
     /// ```
     pub fn pop(&self) -> Option<T> {
-        epoch::pin(|pin| {
-            let mut head = self.head.load(pin);
+        epoch::pin(|scope| {
+            let mut head = self.head.load(Acquire, scope);
             loop {
-                match head.as_ref() {
+                match unsafe { head.as_ref() } {
                     Some(h) => {
-                        let next = h.next.load(pin);
-                        match self.head.cas(head, next) {
-                            Ok(_) => unsafe {
-                                epoch::defer_free(head.as_raw(), 1, pin);
+                        let next = h.next.load(Acquire, scope);
+                        match self.head.compare_and_swap_weak(head, next, AcqRel, scope) {
+                            Ok(()) => unsafe {
+                                scope.defer_free(head);
                                 return Some(ptr::read(&h.value));
                             },
                             Err(h) => head = h,
@@ -128,13 +128,15 @@ impl<T> Stack<T> {
 impl<T> Drop for Stack<T> {
     fn drop(&mut self) {
         // Destruct all nodes in the stack.
-        let mut curr = self.head.load_raw(Relaxed).0;
-        while !curr.is_null() {
-            unsafe {
-                let next = (*curr).next.load_raw(Relaxed).0;
-                drop(Box::from_raw(curr));
-                curr = next;
-            }
+        unsafe {
+            epoch::unprotected(|scope| {
+                let mut curr = self.head.load(Relaxed, scope).as_raw();
+                while !curr.is_null() {
+                    let next = (*curr).next.load(Relaxed, scope).as_raw();
+                    drop(Box::from_raw(curr as *mut Node<T>));
+                    curr = next;
+                }
+            })
         }
     }
 }
