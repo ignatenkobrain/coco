@@ -128,6 +128,7 @@ impl Bag {
 ///
 /// [`flush`]: method.flush.html
 /// [`collect`]: method.collect.html
+#[deprecated(since = "0.2.0", note = "Use scope::defer_free and scope::defer_drop instead")]
 pub struct Garbage {
     /// Head of the queue.
     head: Atomic<Bag>,
