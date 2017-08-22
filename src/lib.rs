@@ -22,7 +22,7 @@
 //!
 //! * You want a simple shared collection where objects can be insert and removed.
 //! * You want to avoid performance degradation due to locking.
-//! * You want the first-in first-out order of elements.
+//! * You want the last-in first-out order of elements.
 //!
 //! ### Use a [`deque`] when:
 //!
