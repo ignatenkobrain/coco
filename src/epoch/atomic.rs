@@ -610,6 +610,15 @@ impl<T> Owned<T> {
     }
 }
 
+impl<T> Drop for Owned<T> {
+    fn drop(&mut self) {
+        let raw = (self.data & !low_bits::<T>()) as *mut T;
+        unsafe {
+            drop(Box::from_raw(raw));
+        }
+    }
+}
+
 impl<T> Deref for Owned<T> {
     type Target = T;
 
