@@ -657,6 +657,10 @@ impl<'scope, T> Clone for Ptr<'scope, T> {
 impl<'scope, T> Copy for Ptr<'scope, T> {}
 
 impl<'scope, T> Ptr<'scope, T> {
+    pub unsafe fn destroy(self) {
+        drop(Box::from_raw(self.as_raw() as *mut T));
+    }
+
     /// Returns a new pointer initialized with the tagged pointer `data`.
     fn from_data(data: usize) -> Self {
         Ptr {
