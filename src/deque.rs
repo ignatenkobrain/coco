@@ -70,6 +70,20 @@ const DEFAULT_MIN_CAP: usize = 16;
 /// Typical cache line size in bytes on modern machines.
 const CACHE_LINE_BYTES: usize = 64;
 
+/// When weakly stealing some data, this is an enumeration of the possible outcomes.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+pub enum Steal<T> {
+    /// The deque was empty at the time of stealing.
+    Empty,
+
+    /// Some data has been successfully stolen.
+    Data(T),
+
+    /// Inconsistent state was encountered because another concurrent operation got in the way.
+    /// A retry may return more data.
+    Inconsistent,
+}
+
 /// A buffer where deque elements are stored.
 struct Buffer<T> {
     /// Pointer to the allocated memory.
@@ -286,7 +300,7 @@ impl<T> Deque<T> {
     }
 
     /// Steals an element from the top of the deque.
-    fn steal(&self) -> Option<T> {
+    fn steal(&self, weak: bool) -> Steal<T> {
         // Load the top.
         let mut t = self.top.load(Acquire);
 
@@ -305,7 +319,7 @@ impl<T> Deque<T> {
 
                 // Is the deque empty?
                 if b.wrapping_sub(t) <= 0 {
-                    return None;
+                    return Steal::Empty;
                 }
 
                 // Load the buffer and read the value at the top.
@@ -314,11 +328,15 @@ impl<T> Deque<T> {
 
                 // Try incrementing the top to steal the value.
                 if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
-                    return Some(value);
+                    return Steal::Data(value);
                 }
 
                 // We didn't steal this value, forget it.
                 mem::forget(value);
+
+                if weak {
+                    return Steal::Inconsistent;
+                }
 
                 // Before every iteration of the loop we must load the top, issue a SeqCst fence,
                 // and then load the bottom. Now reload the top and issue the fence.
@@ -329,24 +347,24 @@ impl<T> Deque<T> {
     }
 
     /// Steals an element from the top of the deque, but only the worker may call this method.
-    fn steal_as_worker(&self) -> Option<T> {
+    fn steal_as_worker(&self) -> Steal<T> {
         let b = self.bottom.load(Relaxed);
         let a = unsafe { epoch::unprotected(|scope| self.buffer.load(Relaxed, scope).as_raw()) };
 
-        // Loop until we successfully steal an element or find the deque empty.
-        loop {
-            let t = self.top.load(Relaxed);
+        let t = self.top.load(Relaxed);
 
-            // Is the deque empty?
-            if b.wrapping_sub(t) <= 0 {
-                return None;
-            }
-
-            // Try incrementing the top to steal the value.
-            if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
-                return unsafe { Some((*a).read(t)) };
-            }
+        // Is the deque empty?
+        if b.wrapping_sub(t) <= 0 {
+            return Steal::Empty;
         }
+
+        // Try incrementing the top to steal the value.
+        if self.top.compare_exchange(t, t.wrapping_add(1), SeqCst, Relaxed).is_ok() {
+            let data = unsafe { (*a).read(t) };
+            return Steal::Data(data);
+        }
+
+        Steal::Inconsistent
     }
 }
 
@@ -452,6 +470,32 @@ impl<T> Worker<T> {
     /// assert_eq!(w.steal(), None);
     /// ```
     pub fn steal(&self) -> Option<T> {
+        loop {
+            match self.deque.steal_as_worker() {
+                Steal::Empty => return None,
+                Steal::Data(data) => return Some(data),
+                Steal::Inconsistent => {}
+            }
+        }
+    }
+
+    /// Steals an element from the top of the deque, but may sometimes spuriously fail.
+    ///
+    /// If another concurrent operation gets in the way when stealing data, this method will return
+    /// immediately with [`Steal::Inconsistent`] instead of retrying.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::deque::{self, Steal};
+    ///
+    /// let (w, _) = deque::new();
+    /// w.push(1);
+    /// assert_eq!(w.steal_weak(), Steal::Data(1));
+    /// ```
+    ///
+    /// [`Steal::Inconsistent`]: enum.Steal.html#variant.Inconsistent
+    pub fn steal_weak(&self) -> Steal<T> {
         self.deque.steal_as_worker()
     }
 }
@@ -509,7 +553,31 @@ impl<T> Stealer<T> {
     /// assert_eq!(s.steal(), None);
     /// ```
     pub fn steal(&self) -> Option<T> {
-        self.deque.steal()
+        match self.deque.steal(false) {
+            Steal::Empty => None,
+            Steal::Data(data) => Some(data),
+            Steal::Inconsistent => unreachable!(),
+        }
+    }
+
+    /// Steals an element from the top of the deque, but may sometimes spuriously fail.
+    ///
+    /// If another concurrent operation gets in the way when stealing data, this method will return
+    /// immediately with [`Steal::Inconsistent`] instead of retrying.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use coco::deque::{self, Steal};
+    ///
+    /// let (w, s) = deque::new();
+    /// w.push(1);
+    /// assert_eq!(s.steal_weak(), Steal::Data(1));
+    /// ```
+    ///
+    /// [`Steal::Inconsistent`]: enum.Steal.html#variant.Inconsistent
+    pub fn steal_weak(&self) -> Steal<T> {
+        self.deque.steal(true)
     }
 }
 
