@@ -65,7 +65,7 @@ use std::sync::atomic::Ordering::{Acquire, Release, Relaxed, SeqCst};
 use epoch::{self, Atomic, Owned};
 
 /// Minimum buffer capacity for a deque.
-const MIN_CAP: usize = 16;
+const DEFAULT_MIN_CAP: usize = 16;
 
 /// Typical cache line size in bytes on modern machines.
 const CACHE_LINE_BYTES: usize = 64;
@@ -79,7 +79,7 @@ struct Buffer<T> {
 }
 
 impl<T> Buffer<T> {
-    /// Returns a new buffe with the specified capacity.
+    /// Returns a new buffer with the specified capacity.
     fn new(cap: usize) -> Self {
         let mut v = Vec::with_capacity(cap);
         let ptr = v.as_mut_ptr();
@@ -117,9 +117,19 @@ impl<T> Drop for Buffer<T> {
 
 #[repr(C)]
 struct Deque<T> {
+    /// The bottom index.
     bottom: AtomicIsize,
+
+    /// The top index.
     top: AtomicIsize,
+
+    /// The underlying buffer.
     buffer: Atomic<Buffer<T>>,
+
+    /// Minimal capacity of the buffer. Always a power of two.
+    min_cap: usize,
+
+    /// Some padding to avoid false sharing.
     _pad0: [u8; CACHE_LINE_BYTES],
 }
 
@@ -127,10 +137,19 @@ struct Deque<T> {
 impl<T> Deque<T> {
     /// Returns a new, empty deque.
     fn new() -> Self {
+        Self::with_capacity(DEFAULT_MIN_CAP)
+    }
+
+    /// Returns a new, empty deque with the specified minimal capacity.
+    ///
+    /// Note that the capacity will actually be rounded to the next power of two.
+    fn with_capacity(cap: usize) -> Self {
+        let cap = cap.next_power_of_two();
         Deque {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
-            buffer: Atomic::new(Buffer::new(MIN_CAP)),
+            buffer: Atomic::new(Buffer::new(cap)),
+            min_cap: cap,
             _pad0: [0; CACHE_LINE_BYTES],
         }
     }
@@ -256,7 +275,7 @@ impl<T> Deque<T> {
                 // Shrink the buffer if `len` is less than one fourth of `cap`.
                 unsafe {
                     let cap = (*a).cap;
-                    if cap > MIN_CAP && len < cap as isize / 4 {
+                    if cap > self.min_cap && len < cap as isize / 4 {
                         self.resize(cap / 2);
                     }
                 }
