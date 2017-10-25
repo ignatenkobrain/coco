@@ -67,6 +67,9 @@ use epoch::{self, Atomic, Owned};
 /// Minimum buffer capacity for a deque.
 const MIN_CAP: usize = 16;
 
+/// Typical cache line size in bytes on modern machines.
+const CACHE_LINE_BYTES: usize = 64;
+
 /// A buffer where deque elements are stored.
 struct Buffer<T> {
     /// Pointer to the allocated memory.
@@ -112,10 +115,12 @@ impl<T> Drop for Buffer<T> {
     }
 }
 
+#[repr(C)]
 struct Deque<T> {
     bottom: AtomicIsize,
     top: AtomicIsize,
     buffer: Atomic<Buffer<T>>,
+    _pad0: [u8; CACHE_LINE_BYTES],
 }
 
 /// A work-stealing deque.
@@ -126,6 +131,7 @@ impl<T> Deque<T> {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
             buffer: Atomic::new(Buffer::new(MIN_CAP)),
+            _pad0: [0; CACHE_LINE_BYTES],
         }
     }
 
