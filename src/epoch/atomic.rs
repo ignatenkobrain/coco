@@ -10,13 +10,12 @@ use epoch::Scope;
 /// appropriate ordering for the failure case.
 #[inline]
 fn strongest_failure_ordering(ord: Ordering) -> Ordering {
-    use self::Ordering::*;
+    use std::sync::atomic::Ordering::*;
     match ord {
         Relaxed => Relaxed,
         Release => Relaxed,
         Acquire => Acquire,
         AcqRel => Acquire,
-        SeqCst => SeqCst,
         _ => SeqCst,
     }
 }
