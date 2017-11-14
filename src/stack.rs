@@ -87,7 +87,7 @@ impl<T> Stack<T> {
         })
     }
 
-    /// Attemps to pop an value from the stack.
+    /// Attempts to pop an value from the stack.
     ///
     /// Returns `None` if the stack is empty.
     ///
