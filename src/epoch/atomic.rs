@@ -597,10 +597,10 @@ impl<T> Owned<T> {
     /// ```
     /// use coco::epoch::Owned;
     ///
-    /// let o = Owned::new(0u64);
+    /// let o = Owned::new(0u32);
     /// assert_eq!(o.tag(), 0);
-    /// let o = o.with_tag(5);
-    /// assert_eq!(o.tag(), 5);
+    /// let o = o.with_tag(3);
+    /// assert_eq!(o.tag(), 3);
     /// ```
     pub fn with_tag(self, tag: usize) -> Self {
         let data = self.data;
@@ -833,10 +833,10 @@ impl<'scope, T> Ptr<'scope, T> {
     /// use coco::epoch::{self, Atomic, Owned};
     /// use std::sync::atomic::Ordering::SeqCst;
     ///
-    /// let a = Atomic::from_owned(Owned::new(0u64).with_tag(5));
+    /// let a = Atomic::from_owned(Owned::new(0u32).with_tag(3));
     /// epoch::pin(|scope| {
     ///     let p = a.load(SeqCst, scope);
-    ///     assert_eq!(p.tag(), 5);
+    ///     assert_eq!(p.tag(), 3);
     /// });
     /// ```
     pub fn tag(&self) -> usize {
@@ -851,13 +851,13 @@ impl<'scope, T> Ptr<'scope, T> {
     /// use coco::epoch::{self, Atomic};
     /// use std::sync::atomic::Ordering::SeqCst;
     ///
-    /// let a = Atomic::new(0u64);
+    /// let a = Atomic::new(0u32);
     /// epoch::pin(|scope| {
     ///     let p1 = a.load(SeqCst, scope);
-    ///     let p2 = p1.with_tag(5);
+    ///     let p2 = p1.with_tag(3);
     ///
     ///     assert_eq!(p1.tag(), 0);
-    ///     assert_eq!(p2.tag(), 5);
+    ///     assert_eq!(p2.tag(), 3);
     ///     assert_eq!(p1.as_raw(), p2.as_raw());
     /// });
     /// ```
