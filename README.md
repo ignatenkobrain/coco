@@ -1,11 +1,11 @@
-# Concurrent collections
+# Concurrent collections (deprecated)
 
 [![Build Status](https://travis-ci.org/stjepang/coco.svg?branch=master)](https://travis-ci.org/stjepang/coco)
 [![License](https://img.shields.io/badge/license-Apache--2.0%2FMIT-blue.svg)](https://github.com/stjepang/coco)
 [![Cargo](https://img.shields.io/crates/v/coco.svg)](https://crates.io/crates/coco)
 [![Documentation](https://docs.rs/coco/badge.svg)](https://docs.rs/coco)
 
-**This is an experimental crate that will be soon deprecated in favor of Crossbeam.**
+**NOTE:** This crate is now deprecated in favor of [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam-epoch).
 
 This crate offers several collections that are designed for performance in multithreaded
 contexts. They can be freely shared among multiple threads running in parallel, and concurrently
