@@ -5,7 +5,7 @@
 [![Cargo](https://img.shields.io/crates/v/coco.svg)](https://crates.io/crates/coco)
 [![Documentation](https://docs.rs/coco/badge.svg)](https://docs.rs/coco)
 
-**NOTE:** This crate is now deprecated in favor of [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam-epoch).
+**NOTE:** This crate is now deprecated in favor of Crossbeam. See [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam-epoch) and [crossbeam-deque](https://github.com/crossbeam-rs/crossbeam-deque).
 
 This crate offers several collections that are designed for performance in multithreaded
 contexts. They can be freely shared among multiple threads running in parallel, and concurrently
