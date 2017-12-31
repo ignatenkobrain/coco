@@ -16,7 +16,7 @@ either = "1.0"
 scopeguard = "0.3"
 
 [dev-dependencies]
-rand = "0.3"
+rand = "0.4"
 
 [features]
 strict_gc = []
